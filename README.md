@@ -16,6 +16,8 @@
 
 本地连接配置示例：
 
+后台 Agent 更新：先将新版 `stop_agent.bat` 和 `stop_agent.ps1` 放进当前运行的 Agent 目录，双击 `stop_agent.bat`，提示停止成功后再覆盖 `CodexAuthAgent.exe` 及启动脚本。保留 `agent_config.json` 和 `agent_config.state.json`。更新后运行 `install_autostart.ps1` 恢复后台运行，或双击 `start_agent.bat` 前台运行。停止脚本只结束当前目录的 Agent，会临时禁用计划任务避免更新期间重启，停止完成后保留原来的登录自动启动设置。如提示权限不足，使用启动 Agent 的 Windows 用户运行；原进程以管理员身份运行时，也需以管理员身份停止。
+
 ```json
 {
   "server_url": "http://172.28.26.33:8000",

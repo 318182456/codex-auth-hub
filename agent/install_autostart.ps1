@@ -3,6 +3,7 @@ param([switch]$Remove)
 $ErrorActionPreference = 'Stop'
 $taskName = 'CodexAuthHubAgent'
 if ($Remove) {
+    & (Join-Path $PSScriptRoot 'stop_agent.ps1') -KeepTaskDisabled
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host 'Agent autostart removed.'
     exit
