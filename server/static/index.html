@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex Auth Hub - 认证中枢管理面板</title>
+  <link rel="stylesheet" href="style.css?v=auth-status-rename-2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- 侧边/顶部导航 -->
+    <header class="navbar">
+      <div class="nav-brand">
+        <div class="brand-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">Codex Auth Hub</h1>
+          <span class="brand-subtitle">集中式认证分发 & 在线状态实时追踪</span>
+        </div>
+      </div>
+      <div class="nav-actions">
+        <div class="status-indicator">
+          <span class="pulse-dot"></span>
+          <span id="sync-status">实时同步中</span>
+        </div>
+        <button id="btn-open-upload" class="btn btn-primary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+          </svg>
+          上传/更新认证 (auth.json)
+        </button>
+        <button id="btn-refresh" class="btn btn-secondary" title="手动刷新">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- 核心统计概览 -->
+    <main class="main-content">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-meta">
+            <span class="stat-label">服务端节点总数</span>
+            <div class="stat-badge">DB: codex_auth_hub</div>
+          </div>
+          <div class="stat-value" id="stat-total-profiles">0</div>
+          <div class="stat-foot">可用认证配置</div>
+        </div>
+
+        <div class="stat-card stat-accent">
+          <div class="stat-meta">
+            <span class="stat-label">全网当前在线人数</span>
+            <div class="stat-badge green">心跳活跃 (90s)</div>
+          </div>
+          <div class="stat-value" id="stat-active-users">0</div>
+          <div class="stat-foot">正在使用 Codex 的用户总数</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-meta">
+            <span class="stat-label">客户端使用指南</span>
+            <div class="stat-badge">PowerShell / GUI</div>
+          </div>
+          <div class="stat-quick-link">
+            一键下载并应用至 <code>~/.codex/auth.json</code>
+          </div>
+          <div class="stat-foot">免手动复制文件，自动保持在线</div>
+        </div>
+
+        <div class="stat-card" style="border-color: rgba(59, 130, 246, 0.35); background: linear-gradient(145deg, rgba(23, 27, 40, 0.85), rgba(59, 130, 246, 0.08));">
+          <div class="stat-meta">
+            <span class="stat-label">🛠️ 离线开发环境包</span>
+            <div class="stat-badge" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa;">免外网 / 局域网高速</div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px; font-size: 0.825rem; margin-top: 2px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span>Node.js v20 LTS</span>
+              <a href="/api/packages/download/node-v20-x64.msi" class="btn btn-sm btn-secondary" style="padding: 2px 8px; font-size: 0.75rem;">下载 (25 MB)</a>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span>Codex CLI 0.162.1</span>
+              <a href="/api/packages/download/openai-codex.tgz" class="btn btn-sm btn-secondary" style="padding: 2px 8px; font-size: 0.75rem;">下载 (5 KB)</a>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span>VS Code Codex 插件</span>
+              <a href="/api/packages/download/openai.chatgpt.vsix" class="btn btn-sm btn-secondary" style="padding: 2px 8px; font-size: 0.75rem;">下载 (522 MB)</a>
+            </div>
+          </div>
+          <div class="stat-foot" style="margin-top: 6px;">客户端支持环境体检与一键离线安装</div>
+        </div>
+      </div>
+
+      <section class="section" aria-label="Agent 连接状态">
+        <div class="section-header">
+          <div class="section-title-wrap">
+            <h2 class="section-title">登录服务器 Agent <span id="agents-summary" class="text-muted"></span></h2>
+            <p class="section-desc">根据连接 IP 和本机当前登录账号自动识别，无法匹配时可手动关联。每 30 秒心跳，超过 90 秒显示离线。</p>
+          </div>
+        </div>
+        <div class="logs-container">
+          <table class="table">
+            <thead><tr><th>主机 / IP</th><th>连接状态</th><th>本机当前账号</th><th>关联账号 / 同步状态</th><th>最近心跳</th><th>版本</th><th>关联设置</th></tr></thead>
+            <tbody id="agents-tbody"><tr><td colspan="7" class="text-center text-muted">正在加载 Agent 状态...</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 服务端节点列表卡片 -->
+      <section class="section">
+        <div class="section-header">
+          <div class="section-title-wrap">
+            <h2 class="section-title">服务端节点与在线用户清单</h2>
+            <p class="section-desc">客户端可选择任意在线服务端并下载凭据，系统将实时统计使用人数及成员名单。</p>
+          </div>
+          <div class="search-wrap">
+            <input type="text" id="filter-input" placeholder="按名称、邮箱或用户名搜索..." class="input-search">
+          </div>
+        </div>
+
+        <div id="profiles-grid" class="profiles-grid">
+          <div class="loading-state">正在加载配置与在线状态...</div>
+        </div>
+      </section>
+
+      <!-- 隐藏的快速替换 auth.json 文件输入框 -->
+      <input type="file" id="replace-file-input" accept=".json" style="display:none;">
+
+      <!-- 团队成员与在线状态 (按 user 分开不同的人) -->
+      <section class="section">
+        <div class="section-header">
+          <div class="section-title-wrap">
+            <h2 class="section-title">团队成员清单 (按 User 分开独立追踪)</h2>
+            <p class="section-desc">已注册的团队成员、当前分别占用的账号节点及最近活跃状态 (一人同一时间仅占一个账号)。</p>
+          </div>
+          <div>
+            <button class="btn btn-primary btn-sm" id="btn-open-add-user">➕ 添加新成员</button>
+          </div>
+        </div>
+        <div class="logs-container">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>用户名</th>
+                <th>姓名 / 担当</th>
+                <th>权限角色</th>
+                <th>当前正在使用的账号</th>
+                <th>连入时间</th>
+                <th>最近登录</th>
+                <th style="text-align: right;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="users-tbody">
+              <tr><td colspan="7" class="text-center text-muted">正在加载用户数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 操作审计日志 -->
+      <section class="section logs-section">
+        <div class="section-header">
+          <h2 class="section-title">实时审计与使用日志</h2>
+          <span class="text-muted" id="logs-count">最近记录</span>
+        </div>
+        <div class="logs-container">
+          <table class="table" id="logs-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>动作</th>
+                <th>配置节点</th>
+                <th>使用者 / 用户名</th>
+                <th>主机名称</th>
+                <th>IP 地址</th>
+                <th>详情说明</th>
+              </tr>
+            </thead>
+            <tbody id="logs-tbody">
+              <tr><td colspan="7" class="text-center text-muted">暂无日志</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 上传/添加弹窗 -->
+  <div id="modal-upload" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 class="modal-title">上传 Codex 认证配置</h3>
+        <button class="modal-close" id="btn-close-modal">&times;</button>
+      </div>
+      <form id="form-upload" class="modal-body">
+        <div class="form-group">
+          <label for="input-name">节点/配置名称 <span class="required">*</span></label>
+          <input type="text" id="input-name" class="form-control" placeholder="例如: Codex-主账号-01" required>
+        </div>
+
+        <div class="form-group">
+          <label for="input-desc">描述信息 / 适用场景</label>
+          <input type="text" id="input-desc" class="form-control" placeholder="例如: 共享开发环境专用 / 极速通道">
+        </div>
+
+        <div class="form-group">
+          <label for="input-max-users">最大使用人数限制 (0为不限制)</label>
+          <input type="number" id="input-max-users" class="form-control" value="0" min="0">
+        </div>
+
+        <div class="form-group">
+          <label>认证文件 (auth.json)</label>
+          <div class="tabs">
+            <button type="button" class="tab-btn active" data-tab="tab-file">文件上传</button>
+            <button type="button" class="tab-btn" data-tab="tab-json">直接粘贴 JSON</button>
+          </div>
+
+          <div id="tab-file" class="tab-panel active">
+            <div class="drop-zone" id="drop-zone">
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242M12 12v9m-4-4 4-4 4 4"/>
+              </svg>
+              <p>拖拽 <strong>auth.json</strong> 到此处，或 <span class="browse-link">点击浏览</span></p>
+              <input type="file" id="file-input" accept=".json" style="display: none;">
+              <span id="file-name-display" class="file-name-chip"></span>
+            </div>
+          </div>
+
+          <div id="tab-json" class="tab-panel">
+            <textarea id="json-textarea" class="form-control code-textarea" rows="8" placeholder='{"tokens": {"access_token": "..."}, "OPENAI_API_KEY": "..."}'></textarea>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-modal">取消</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-upload">保存并分发</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 管理员添加用户弹窗 -->
+  <div id="modal-add-user" class="modal-backdrop">
+    <div class="modal" style="max-width: 440px;">
+      <div class="modal-header">
+        <h3 class="modal-title">添加团队新成员 / User</h3>
+        <button class="modal-close" id="btn-close-user-modal">&times;</button>
+      </div>
+      <form id="form-add-user" class="modal-body">
+        <div class="form-group">
+          <label for="input-user-name">用户名 / 登录账号 <span class="required">*</span></label>
+          <input type="text" id="input-user-name" class="form-control" placeholder="例如: zhangsan" required>
+        </div>
+
+        <div class="form-group">
+          <label for="input-user-pwd">登录密码 <span class="required">*</span></label>
+          <input type="password" id="input-user-pwd" class="form-control" placeholder="例如: 123456" required>
+        </div>
+
+        <div class="form-group">
+          <label for="input-user-display">姓名 / 担当称呼</label>
+          <input type="text" id="input-user-display" class="form-control" placeholder="例如: 张三">
+        </div>
+
+        <div class="form-group">
+          <label for="select-user-role">权限角色</label>
+          <select id="select-user-role" class="form-control">
+            <option value="user" selected>普通团队成员 (user)</option>
+            <option value="admin">管理员 (admin)</option>
+          </select>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btn-cancel-user-modal">取消</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-user">确认创建</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+  <div class="modal-backdrop" id="modal-agent-binding">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="agent-binding-title">
+      <div class="modal-header"><h2 class="modal-title" id="agent-binding-title">Agent 账号关联</h2>
+        <button type="button" class="modal-close" id="close-agent-binding" aria-label="关闭">×</button></div>
+      <form id="form-agent-binding" class="modal-body">
+        <p id="agent-binding-info" class="text-muted"></p>
+        <div class="form-group"><label for="agent-binding-profile">关联账号</label>
+          <select id="agent-binding-profile" class="form-control"></select>
+        </div>
+        <p class="text-muted">默认自动匹配本机当前账号。匹配不到或存在重复账号时，选择需要更新的账号；设置将在下一次心跳后生效。</p>
+        <div class="modal-footer"><button type="button" class="btn btn-secondary" id="cancel-agent-binding">取消</button>
+          <button type="submit" class="btn btn-primary" id="save-agent-binding">保存关联</button></div>
+      </form>
+    </div>
+  </div>
+  <script src="app.js?v=agent-binding-2"></script>
+</body>
+</html>

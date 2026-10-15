@@ -1,0 +1,38 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Build output and bundled installers
+build/
+dist/
+packages/
+*.exe
+*.msi
+*.zip
+*.tgz
+*.vsix
+
+# Machine-specific configuration and authentication
+.env
+.env.*
+!.env.example
+db_config.json
+auth.json
+auth.json.*
+agent_config.json
+agent_config.state.json
+*.log
+*.log.*
+*.pem
+*.key
+.aws/
+.codex/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
