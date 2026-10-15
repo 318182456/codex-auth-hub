@@ -14,11 +14,19 @@ if ($task) {
     if (-not $matchesDirectory) {
         throw 'The scheduled Agent belongs to another directory. Run stop_agent.bat from the installed Agent directory.'
     }
-    $restoreTask = $task.State -ne 'Disabled'
-    Disable-ScheduledTask -TaskName $taskName | Out-Null
+    try {
+        $restoreTask = $task.State -ne 'Disabled'
+        Disable-ScheduledTask -TaskName $taskName | Out-Null
+    } catch {
+        $restoreTask = $false
+        Write-Warning 'Cannot control the scheduled task. Trying to stop the current user Agent directly.'
+    }
 }
 try {
-    if ($task) { Stop-ScheduledTask -TaskName $taskName }
+    if ($task) {
+        try { Stop-ScheduledTask -TaskName $taskName }
+        catch { Write-Warning 'Cannot stop the scheduled task; checking the Agent process directly.' }
+    }
     # PyInstaller may have both a bootloader and a child process with the same path.
     $processes = @(Get-Process -Name CodexAuthAgent -ErrorAction SilentlyContinue | Where-Object {
         $_.Path -and [System.IO.Path]::GetFullPath($_.Path) -eq $exePath

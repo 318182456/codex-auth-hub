@@ -12,11 +12,13 @@
 1. 将整个 `agent` 目录复制到登录机器，将 `agent_config.example.json` 复制为 `agent_config.json`。
 2. 本地只需修改 `server_url` 为中枢地址，**无需配置 `watches`、账号 ID 或认证文件路径**。旧版配置中残留的 `watches` 会被忽略。
 3. 运行 `启动Agent.bat`（部署包解压后运行 `start_agent.bat`）。Agent 自动读取本机当前登录账号并报告至服务端：优先用 `account_id` 唯一匹配已有账号，无法取得账号 ID 的历史记录可用邮箱辅助匹配。未匹配或存在重复账号时不上传，在服务端对应主机/IP 行点击「关联账号」，选择已有账号后保存即可。也可选择「自动匹配当前账号」恢复自动关联；设置在下一次心跳后生效，无需重启 Agent。
-4. 配置确认后，可在 PowerShell 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\agent\install_autostart.ps1`，注册当前 Windows 用户登录后自动启动，并立即运行。不要同时再手动启动第二份 Agent。取消自动启动使用相同命令追加 `-Remove`（只取消后续启动；停止当前任务可用 `Stop-ScheduledTask -TaskName CodexAuthHubAgent`）。
+4. 配置确认后，可在 PowerShell 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\agent\install_autostart.ps1`，设置当前 Windows 用户登录后自动启动，并立即后台运行。**默认使用当前用户启动文件夹快捷方式，不注册计划任务，无需管理员权限。**该方式登录后启动，但不提供进程崩溃后的自动重启。确实需要计划任务时可追加 `-UseScheduledTask`；注册失败会回退启动文件夹，成功提示仅在确认 Agent 进程后显示。旧参数 `-UseStartupFolder` 仍兼容。不要同时再手动启动第二份 Agent。取消自动启动使用相同命令追加 `-Remove`，会移除启动快捷方式并停止 Agent、移除计划任务；若已有计划任务由管理员创建，移除该任务仍可能需要相应权限。
 
 本地连接配置示例：
 
 后台 Agent 更新：先将新版 `stop_agent.bat` 和 `stop_agent.ps1` 放进当前运行的 Agent 目录，双击 `stop_agent.bat`，提示停止成功后再覆盖 `CodexAuthAgent.exe` 及启动脚本。保留 `agent_config.json` 和 `agent_config.state.json`。更新后运行 `install_autostart.ps1` 恢复后台运行，或双击 `start_agent.bat` 前台运行。停止脚本只结束当前目录的 Agent，会临时禁用计划任务避免更新期间重启，停止完成后保留原来的登录自动启动设置。如提示权限不足，使用启动 Agent 的 Windows 用户运行；原进程以管理员身份运行时，也需以管理员身份停止。
+
+后台启动检查：`install_autostart.ps1` 和 `run_hidden.ps1 -StartOnly` 会检查启动后 3 秒内是否退出，成功显示 PID，失败直接显示退出码及错误信息。启动输出保存在 `agent_startup.stderr.log` / `agent_startup.stdout.log`，运行日志为 `agent_config.log`。独立启动可执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\run_hidden.ps1 -StartOnly`；无需重新注册自动启动。复制更新时必须同时替换这两个脚本。
 
 ```json
 {
