@@ -152,7 +152,8 @@ def format_plan_type(raw_plan: str) -> str:
     return raw_plan
 
 
-def parse_quota_windows(data: dict, now: Optional[datetime] = None) -> Dict[str, Any]:
+def parse_quota_windows(data: dict, now: Optional[datetime] = None,
+                        observed_at: Optional[datetime] = None) -> Dict[str, Any]:
     """按官方返回的周期识别窗口，primary/secondary 不代表固定周期。"""
     now = now or datetime.now(timezone.utc)
     windows = {}
@@ -162,6 +163,7 @@ def parse_quota_windows(data: dict, now: Optional[datetime] = None) -> Dict[str,
             "used_percent": None, "remaining_percent": None,
             "reset_after_seconds": None, "reset_after_text": "未知",
             "reset_at": None, "reset_at_epoch": None, "limit_reached": False,
+            "reset_source": None,
         }
     rate_limit = data.get("rate_limit") or {}
     for field in ("primary_window", "secondary_window"):
@@ -185,6 +187,15 @@ def parse_quota_windows(data: dict, now: Optional[datetime] = None) -> Dict[str,
         else:
             reset_epoch = None
         seconds = window.get("reset_after_seconds")
+        reported_seconds = seconds if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else None
+        reset_source = "official" if reset_time is not None else None
+        if reset_time is None and isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+            try:
+                reset_time = (observed_at or now) + timedelta(seconds=max(0, seconds))
+                reset_epoch = reset_time.timestamp()
+                reset_source = "estimated"
+            except (ValueError, OverflowError):
+                seconds = None
         if reset_time is not None:
             seconds = max(0, int((reset_time - now).total_seconds()))
         elif isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
@@ -197,6 +208,8 @@ def parse_quota_windows(data: dict, now: Optional[datetime] = None) -> Dict[str,
             "reset_after_seconds": seconds, "reset_after_text": format_duration(seconds),
             "reset_at": reset_time.isoformat() if reset_time else None,
             "reset_at_epoch": reset_epoch, "limit_reached": used is not None and used >= 100,
+            "reset_source": reset_source,
+            "reported_reset_after_seconds": reported_seconds,
         })
     return windows
 
@@ -211,8 +224,8 @@ def build_profile_quota(profile: dict, now: Optional[datetime] = None) -> Dict[s
             raw = {}
     if not isinstance(raw, dict):
         raw = {}
-    windows = parse_quota_windows(raw, now)
     updated = profile.get("quota_last_updated")
+    windows = parse_quota_windows(raw, now, observed_at=updated)
     return {
         "has_data": bool(updated) and any(w["available"] for w in windows.values()),
         "plan_type": profile.get("plan_type") or "CODEX",
@@ -291,7 +304,8 @@ def _fetch_codex_quota(auth_json: dict, profile_id: Optional[int] = None) -> Dic
     raw_plan = (data.get("plan_type") or "").upper()
     plan_type = format_plan_type(raw_plan)
     rate_limit = data.get("rate_limit") or {}
-    windows = parse_quota_windows(data)
+    observed_at = datetime.now(timezone.utc)
+    windows = parse_quota_windows(data, observed_at)
     return outcome(**{
         "success": True,
         "email": email,
@@ -300,6 +314,7 @@ def _fetch_codex_quota(auth_json: dict, profile_id: Optional[int] = None) -> Dic
         "primary_5h": windows["five_hour"],
         "secondary_weekly": windows["weekly"],
         "raw": data,
+        "observed_at": observed_at.isoformat(),
     })
 
 
@@ -327,7 +342,7 @@ def update_profile_quota_in_db(profile_id: int, quota_info: Dict[str, Any]):
                     quota_weekly_used = %s,
                     quota_weekly_reset_seconds = %s,
                     quota_weekly_reset_at = TO_TIMESTAMP(%s),
-                    quota_last_updated = CURRENT_TIMESTAMP,
+                    quota_last_updated = %s,
                     quota_raw = %s
                 WHERE id = %s;
             """, (
@@ -339,7 +354,13 @@ def update_profile_quota_in_db(profile_id: int, quota_info: Dict[str, Any]):
                 pw["used_percent"],
                 pw["reset_after_seconds"],
                 s_reset_at,
+                quota_info.get("observed_at") or datetime.now(timezone.utc),
                 json.dumps(raw),
                 profile_id
             ))
+            # 与缓存同事务保存每次成功查询；只保存额度字段，不保存认证凭据。
+            cur.execute("""
+                INSERT INTO quota_observations (profile_id, observed_at, windows)
+                SELECT id, quota_last_updated, %s::jsonb FROM auth_profiles WHERE id = %s;
+            """, (json.dumps({"five_hour": p5, "weekly": pw}), profile_id))
         conn.commit()

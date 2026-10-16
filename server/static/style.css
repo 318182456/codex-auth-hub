@@ -447,6 +447,19 @@ body {
   gap: 6px;
 }
 
+.quota-timestamp, .quota-history {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.quota-history summary { cursor: pointer; color: #93c5fd; }
+.quota-history label { display: block; margin: 8px 0; }
+.quota-history input { background: var(--bg-input, #151923); color: inherit; border: 1px solid #334155; border-radius: 4px; color-scheme: dark; }
+.quota-history-entries { max-height: 260px; overflow-y: auto; }
+.quota-history-entry { padding: 8px 0; border-bottom: 1px solid #334155; }
+.quota-change { color: #fbbf24; margin: 4px 0; }
+
 .quota-meta {
   display: flex;
   justify-content: space-between;

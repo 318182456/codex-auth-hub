@@ -29,6 +29,41 @@ function showToast(message, type = "info") {
   }, 3500);
 }
 
+function formatQuotaTime(value) {
+  if (!value) return '未知';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '未知' : date.toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false
+  });
+}
+
+async function loadQuotaHistory(profileId) {
+  const target = document.getElementById(`quota-history-${profileId}`);
+  const day = document.getElementById(`quota-history-day-${profileId}`).value;
+  target.textContent = '正在加载…';
+  try {
+    const response = await fetch(`/api/profiles/${profileId}/quota-history?day=${encodeURIComponent(day)}`);
+    if (!response.ok) throw new Error('加载失败');
+    const rows = await response.json();
+    target.innerHTML = rows.length ? rows.map((row, index) => `<div class="quota-history-entry">
+      <strong>查询：${escapeHtml(formatQuotaTime(row.observed_at))}</strong>
+      ${['five_hour', 'weekly'].map(key => {
+        const w = row.windows[key];
+        if (!w || !w.available) return '';
+        const previous = rows[index + 1];
+        const old = previous?.windows[key];
+        const decreased = old?.used_percent != null && w.used_percent != null && w.used_percent < old.used_percent;
+        const resetChanged = old?.reset_at && w.reset_at && Math.abs(new Date(w.reset_at) - new Date(old.reset_at)) > 60000;
+        return `<div>${escapeHtml(w.name)}：已用 ${w.used_percent == null ? '未知' : escapeHtml(String(w.used_percent)) + '%'}<br>
+          预计重置：${escapeHtml(formatQuotaTime(w.reset_at))}${w.reset_source === 'estimated' ? '（按剩余秒数推算）' : ''}
+          ${decreased ? `<div class="quota-change">用量下降：${escapeHtml(String(old.used_percent))}% → ${escapeHtml(String(w.used_percent))}%<br>发生区间：${escapeHtml(formatQuotaTime(previous.observed_at))} 至本次查询</div>` : ''}
+          ${resetChanged ? `<div class="quota-change">预计重置时间已变更，上次：${escapeHtml(formatQuotaTime(old.reset_at))}</div>` : ''}</div>`;
+      }).join('')}</div>`).join('') : '当天暂无记录；记录从新版服务启用后开始。';
+  } catch (error) {
+    target.textContent = '历史加载失败，请重试。';
+  }
+}
+
 function formatPlanName(rawPlan) {
   if (!rawPlan) return 'Team 团队版';
   const p = rawPlan.toUpperCase().trim();
@@ -156,6 +191,7 @@ function updateStats() {
 }
 
 function renderProfiles() {
+  const openHistoryPanels = Array.from(profilesGrid.querySelectorAll('.quota-history[open]'));
   const query = filterInput.value.trim().toLowerCase();
   const filtered = currentProfiles.filter(p => {
     if (!query) return true;
@@ -237,8 +273,9 @@ function renderProfiles() {
             <div class="progress-track"><div class="progress-fill ${color}" style="width: ${w.remaining_percent}%;"></div></div>
             <div class="quota-foot">
               <span>窗口: ${w.window_seconds === 604800 ? '7天' : '5小时'}</span>
-              <span class="quota-reset">${w.reset_after_seconds == null ? '重置时间未知' : `${escapeHtml(w.reset_after_text)}后重置`}</span>
+              <span class="quota-reset">${w.reset_after_seconds == null ? '重置时间未知' : w.reset_after_seconds === 0 ? '预计时间已到，等待查询确认' : `预计 ${escapeHtml(w.reset_after_text)}后重置`}</span>
             </div>
+            <div class="quota-timestamp">预计重置：${escapeHtml(formatQuotaTime(w.reset_at))}${w.reset_source === 'estimated' ? '（推算）' : ''}</div>
           </div>`;
         }).join('')}
       </div>
@@ -247,6 +284,16 @@ function renderProfiles() {
         <span>暂无可用额度数据，请刷新额度</span>
       </div>
     `;
+
+    const quotaHistoryHtml = `<div class="quota-timestamp">额度查询：${escapeHtml(formatQuotaTime(q.last_updated))}（北京时间）</div>
+      <details id="quota-history-panel-${p.id}" class="quota-history" ontoggle="if(this.open) loadQuotaHistory(${p.id})">
+        <summary>额度查询历史</summary>
+        <label>查询日期（北京时间） <input type="date" id="quota-history-day-${p.id}"
+          value="${new Date().toLocaleDateString('sv-SE', {timeZone: 'Asia/Shanghai'})}"
+          onchange="loadQuotaHistory(${p.id})"></label>
+        <div>每天最多显示最近 2000 次查询；用量下降不一定代表周期重置。</div>
+        <div id="quota-history-${p.id}" class="quota-history-entries"></div>
+      </details>`;
 
     return `
       <div class="profile-card" data-id="${p.id}">
@@ -273,6 +320,7 @@ function renderProfiles() {
         ${authHtml}
         ${(authStatus === 'invalid' || authStatus === 'error') && q.has_data ? '<div class="auth-status-row auth-check-time">下方额度为上次成功查询的缓存</div>' : ''}
         ${quotaHtml}
+        ${quotaHistoryHtml}
 
         <div class="users-section">
           <div class="users-title">
@@ -300,6 +348,11 @@ function renderProfiles() {
       </div>
     `;
   }).join("");
+  // 定时刷新卡片时保留历史面板、所选日期和滚动位置。
+  for (const panel of openHistoryPanels) {
+    const replacement = document.getElementById(panel.id);
+    if (replacement) replacement.replaceWith(panel);
+  }
 }
 
 function renderLogs(logs) {

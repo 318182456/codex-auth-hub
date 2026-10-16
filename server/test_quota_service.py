@@ -72,10 +72,42 @@ class QuotaWindowTests(unittest.TestCase):
         with patch("quota_service.get_connection") as connection:
             update_profile_quota_in_db(7, result)
             cursor = connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
-            parameters = cursor.execute.call_args.args[1]
+            parameters = cursor.execute.call_args_list[0].args[1]
             self.assertEqual(parameters[2:5], (None, None, None))
             self.assertEqual(parameters[5], 3)
             self.assertEqual(parameters[7], data["rate_limit"]["primary_window"]["reset_at"])
+            self.assertEqual(parameters[8], result["observed_at"])
+            snapshot, profile_id = cursor.execute.call_args_list[1].args[1]
+            self.assertEqual(profile_id, 7)
+            self.assertEqual(json.loads(snapshot)["weekly"]["used_percent"], 3)
+            self.assertNotIn("test-token", snapshot)
+
+    def test_cached_relative_countdown_uses_query_time(self):
+        raw = {"rate_limit": {"primary_window": {
+            "limit_window_seconds": 604800, "used_percent": 50,
+            "reset_after_seconds": 6 * 86400,
+        }}}
+        profile = {"quota_raw": raw, "quota_last_updated": self.now}
+        quota = build_profile_quota(profile, self.now + timedelta(days=1))
+        weekly = quota["weekly"]
+        self.assertEqual(weekly["reset_after_seconds"], 5 * 86400)
+        self.assertEqual(weekly["reset_at"], (self.now + timedelta(days=6)).isoformat())
+        self.assertEqual(weekly["reset_source"], "estimated")
+        expired = build_profile_quota(profile, self.now + timedelta(days=7))
+        self.assertEqual(expired["weekly"]["reset_after_seconds"], 0)
+        self.assertEqual(expired["weekly"]["used_percent"], 50)
+
+    def test_absolute_reset_takes_priority_and_does_not_extend(self):
+        raw = {"rate_limit": {"primary_window": self.window(604800, 50)}}
+        quota = build_profile_quota({"quota_raw": raw, "quota_last_updated": self.now},
+                                    self.now + timedelta(minutes=30))
+        self.assertEqual(quota["weekly"]["reset_after_seconds"], 1800)
+        self.assertEqual(quota["weekly"]["reset_source"], "official")
+
+    def test_failed_query_is_not_recorded_as_a_reset(self):
+        with patch("quota_service.get_connection") as connection:
+            update_profile_quota_in_db(7, {"success": False, "error": "network"})
+            connection.assert_not_called()
 
 
 class TokenRefreshTests(unittest.TestCase):

@@ -173,6 +173,18 @@ def init_db():
                 ALTER TABLE agent_connections ADD COLUMN IF NOT EXISTS binding_mode VARCHAR(20) NOT NULL DEFAULT 'auto';
             """)
 
+            # 成功查询额度的历史快照，用于核对预计重置时间和用量变化。
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS quota_observations (
+                    id BIGSERIAL PRIMARY KEY,
+                    profile_id INTEGER NOT NULL REFERENCES auth_profiles(id) ON DELETE CASCADE,
+                    observed_at TIMESTAMPTZ NOT NULL,
+                    windows JSONB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_quota_observations_profile_time
+                    ON quota_observations(profile_id, observed_at DESC, id DESC);
+            """)
+
             # 索引
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_sessions_profile_hb ON user_sessions(profile_id, last_heartbeat);

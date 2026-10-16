@@ -4,7 +4,7 @@ import json
 import base64
 import uuid
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
 # 兼容 starlette 1.6+ 与 fastapi 的 Router 启动参数
@@ -54,7 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HEARTBEAT_TIMEOUT_SECONDS = 86400  # 账号占用保留24小时，保证关闭窗口或离线期间仍保持锁定，直到用户主动释放或管理员释放
+# 账号占用不随心跳过期；心跳仅用于判断客户端是否在线。
 HEARTBEAT_ONLINE_THRESHOLD_SECONDS = 120  # 心跳在 120 秒内判定为实时在线
 QUOTA_REFRESH_INTERVAL_SECONDS = 90
 
@@ -254,12 +254,11 @@ def get_current_user_profile(request: Request):
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"""
+            cur.execute("""
                 SELECT s.profile_id, p.name as profile_name, s.session_token, s.connected_at
                 FROM user_sessions s
                 JOIN auth_profiles p ON s.profile_id = p.id
                 WHERE s.client_user = %s
-                  AND s.last_heartbeat >= NOW() - INTERVAL '{HEARTBEAT_TIMEOUT_SECONDS} seconds'
                 ORDER BY s.connected_at DESC
                 LIMIT 1;
             """, (user["username"],))
@@ -285,11 +284,11 @@ def list_team_users():
     """获取所有团队成员及其实时使用状态 (按 user 分开不同的人)"""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"""
+            cur.execute("""
                 SELECT u.id, u.username, u.display_name, u.role, u.is_active, u.created_at, u.last_login,
                        s.profile_id, p.name as active_profile_name, s.connected_at, s.last_heartbeat
                 FROM app_users u
-                LEFT JOIN user_sessions s ON (s.client_user = u.username AND s.last_heartbeat >= NOW() - INTERVAL '{HEARTBEAT_TIMEOUT_SECONDS} seconds')
+                LEFT JOIN user_sessions s ON s.client_user = u.username
                 LEFT JOIN auth_profiles p ON s.profile_id = p.id
                 ORDER BY u.id ASC;
             """)
@@ -483,6 +482,24 @@ def list_profiles(background_tasks: BackgroundTasks):
             "active_users": users
         })
     return result
+
+@app.get("/api/profiles/{profile_id}/quota-history")
+def get_quota_history(profile_id: int, day: Optional[date] = None):
+    """按北京时间查询当天最多 2000 次成功观测。"""
+    china_tz = timezone(timedelta(hours=8))
+    day = day or datetime.now(china_tz).date()
+    start = datetime.combine(day, datetime.min.time(), tzinfo=china_tz)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT observed_at, windows FROM quota_observations
+                WHERE profile_id = %s AND observed_at >= %s AND observed_at < %s
+                ORDER BY observed_at DESC, id DESC LIMIT 2000;
+            """, (profile_id, start, start + timedelta(days=1)))
+            rows = cur.fetchall()
+    return [{"observed_at": row["observed_at"].isoformat(), "windows": row["windows"]}
+            for row in rows]
+
 
 @app.post("/api/profiles/{profile_id}/refresh-quota")
 def refresh_single_quota(profile_id: int):
