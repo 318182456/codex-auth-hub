@@ -17,10 +17,13 @@ from urllib import error, parse, request
 
 
 LOG = logging.getLogger("auth_agent")
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
+_AUTH_FILE_OVERRIDE = None
 
 
 def default_auth_file():
+    if _AUTH_FILE_OVERRIDE is not None:
+        return _AUTH_FILE_OVERRIDE
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
 
 
@@ -287,20 +290,31 @@ class AuthAgent:
                 pass
 
 
-def main():
-    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="Codex 登录机器认证自动上传 Agent")
-    parser.add_argument("--config", type=Path, default=base / "agent_config.json")
-    parser.add_argument("--check", action="store_true", help="仅检查配置，不读取或上传认证")
-    args = parser.parse_args()
-    if hasattr(sys.stderr, "reconfigure"):
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    config_path = args.config.resolve()
+def run_agent(config_path, stop=None, auth_file=None, check=False):
+    global _AUTH_FILE_OVERRIDE
+    previous = _AUTH_FILE_OVERRIDE
+    _AUTH_FILE_OVERRIDE = auth_file
+    try:
+        return _run_agent(config_path, stop, check)
+    finally:
+        _AUTH_FILE_OVERRIDE = previous
+
+
+def _run_agent(config_path, stop, check):
+    if stop is None:
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    else:
+        # Services run in Session 0 without a usable console. All Agent output
+        # goes to its rotating file handler instead of inherited stdio handles.
+        logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+    config_path = config_path.resolve()
     lock_file = None
+    handler = None
     try:
         url, interval, watches = load_config(config_path)
-        if args.check:
+        if check:
             LOG.info("连接配置有效，监测账号由服务端设置")
             return 0
         if os.name == "nt":
@@ -324,19 +338,48 @@ def main():
         agent = AuthAgent(url, watches, config_path.with_suffix(".state.json"))
     except (OSError, ValueError, TypeError, AttributeError):
         LOG.error("配置或同步状态无效，请检查 agent_config.json、路径和文件权限")
+        if lock_file is not None:
+            lock_file.close()
+        if handler is not None:
+            LOG.removeHandler(handler)
+            handler.close()
         return 1
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    if stop is None:
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
     LOG.info("Agent 已启动，等待服务端下发监测账号，每 %s 秒检查一次文件", interval)
     heartbeat_thread = threading.Thread(target=agent.heartbeat_loop, args=(stop,), daemon=True)
     heartbeat_thread.start()
-    while not stop.is_set():
-        agent.check_once()
-        stop.wait(interval)
-    LOG.info("Agent 已停止")
-    heartbeat_thread.join(timeout=11)
+    try:
+        while not stop.is_set():
+            agent.check_once()
+            stop.wait(interval)
+    finally:
+        stop.set()
+        heartbeat_thread.join(timeout=11)
+        if lock_file is not None:
+            lock_file.close()
+        LOG.info("Agent 已停止")
+        LOG.removeHandler(handler)
+        handler.close()
     return 0
+
+
+def main():
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description="Codex 认证 Agent / Windows 服务")
+    parser.add_argument("--config", type=Path, default=base / "agent_config.json")
+    parser.add_argument("--check", action="store_true", help="仅检查配置，不读取或上传认证")
+    parser.add_argument("--service", action="store_true", help="由 Windows 服务管理器调用")
+    parser.add_argument("--auth-file", type=Path, help="实际登录用户的认证路径（服务安装时自动记录）")
+    args = parser.parse_args()
+    if args.service and not args.check:
+        if args.auth_file is None or not args.auth_file.is_absolute():
+            parser.error("Windows 服务必须指定绝对路径 --auth-file")
+        from windows_service import dispatch
+        return dispatch(args.config.resolve(), args.auth_file.resolve())
+    return run_agent(args.config, auth_file=args.auth_file.resolve() if args.auth_file else None, check=args.check)
 
 
 if __name__ == "__main__":

@@ -3,45 +3,20 @@
 专为团队多人共享/管理 OpenAI Codex 认证设计的一体化服务端与客户端系统。
 默认服务端连接地址：**`http://172.28.26.33:8000`**
 
-## 登录服务器 Agent：重新登录后自动上传认证
+## 登录服务器 Agent：Windows 服务
 
-新版管理面板提供「登录服务器 Agent」清单，显示主机/IP、连接状态、本机当前账号、关联账号、同步状态、版本和最近心跳。Agent 启动即上报，之后每 30 秒心跳一次，超过 90 秒未上报判定离线，页面每 5 秒更新；离线记录会保留，服务端重启不会丢失。即使本地认证缺失或上传失败，心跳仍独立运行。使用此功能需同时更新服务端和 Agent；服务端启动会自动创建及升级心跳表，无需手动执行 SQL。
+Agent 已改为 Windows 服务：**开机后未登录用户也能运行**，不再使用登录自启动或隐藏启动脚本。
 
-在实际执行账号登录的 Windows 机器上运行新增的 `agent/CodexAuthAgent.exe`，也可以双击根目录 `启动Agent.bat`。Agent 无需数据库连接，直接调用中枢 API。
+1. 将新版 `CodexAuthAgent.zip` 解压至固定本地目录，保留已有 `agent_config.json` 和 `agent_config.state.json`，修改中枢地址。
+2. 右键 `install_service.bat`，选择「以管理员身份运行」。安装后立即启动，并配置开机自动启动及失败恢复。
+3. 安装器会记录安装用户的 `CODEX_HOME/auth.json` 或用户目录 `.codex/auth.json`。若提权使用其他管理员账号，用管理员 PowerShell 执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\service.ps1 -Action Install -AuthFilePath "C:\Users\实际登录用户\.codex\auth.json"`。
+4. 查看和管理服务使用 `service.ps1 -Action Status / Start / Stop / Restart / Uninstall`，或在 `services.msc` 查找 `Codex Auth Hub Agent`。更新 EXE 前先执行 Stop，替换后执行 Start。
 
-1. 将整个 `agent` 目录复制到登录机器，将 `agent_config.example.json` 复制为 `agent_config.json`。
-2. 本地只需修改 `server_url` 为中枢地址，**无需配置 `watches`、账号 ID 或认证文件路径**。旧版配置中残留的 `watches` 会被忽略。
-3. 运行 `启动Agent.bat`（部署包解压后运行 `start_agent.bat`）。Agent 自动读取本机当前登录账号并报告至服务端：优先用 `account_id` 唯一匹配已有账号，无法取得账号 ID 的历史记录可用邮箱辅助匹配。未匹配或存在重复账号时不上传，在服务端对应主机/IP 行点击「关联账号」，选择已有账号后保存即可。也可选择「自动匹配当前账号」恢复自动关联；设置在下一次心跳后生效，无需重启 Agent。
-4. 配置确认后，可在 PowerShell 运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\agent\install_autostart.ps1`，设置当前 Windows 用户登录后自动启动，并立即后台运行。**默认使用当前用户启动文件夹快捷方式，不注册计划任务，无需管理员权限。**该方式登录后启动，但不提供进程崩溃后的自动重启。确实需要计划任务时可追加 `-UseScheduledTask`；注册失败会回退启动文件夹，成功提示仅在确认 Agent 进程后显示。旧参数 `-UseStartupFolder` 仍兼容。不要同时再手动启动第二份 Agent。取消自动启动使用相同命令追加 `-Remove`，会移除启动快捷方式并停止 Agent、移除计划任务；若已有计划任务由管理员创建，移除该任务仍可能需要相应权限。
+本地仅需中枢连接配置，不需要 `watches`。Agent 心跳报告 IP 和当前登录账号，服务端优先按账号 ID 自动匹配，邮箱辅助；无法匹配时在面板手动关联。每 30 秒心跳，超过 90 秒未收到心跳显示离线，页面每 5 秒更新。
 
-本地连接配置示例：
+服务默认为 LocalSystem，但读取的是安装时明确记录的实际登录用户认证路径。账号失效后仍需人工完成网页登录，新认证会自动上传。网络暂未就绪时自动重试。配置、状态及日志保留原路径，切换成服务不会丢失绑定。
 
-后台 Agent 更新：先将新版 `stop_agent.bat` 和 `stop_agent.ps1` 放进当前运行的 Agent 目录，双击 `stop_agent.bat`，提示停止成功后再覆盖 `CodexAuthAgent.exe` 及启动脚本。保留 `agent_config.json` 和 `agent_config.state.json`。更新后运行 `install_autostart.ps1` 恢复后台运行，或双击 `start_agent.bat` 前台运行。停止脚本只结束当前目录的 Agent，会临时禁用计划任务避免更新期间重启，停止完成后保留原来的登录自动启动设置。如提示权限不足，使用启动 Agent 的 Windows 用户运行；原进程以管理员身份运行时，也需以管理员身份停止。
-
-后台启动检查：`install_autostart.ps1` 和 `run_hidden.ps1 -StartOnly` 会检查启动后 3 秒内是否退出，成功显示 PID，失败直接显示退出码及错误信息。启动输出保存在 `agent_startup.stderr.log` / `agent_startup.stdout.log`，运行日志为 `agent_config.log`。独立启动可执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\run_hidden.ps1 -StartOnly`；无需重新注册自动启动。复制更新时必须同时替换这两个脚本。
-
-```json
-{
-  "server_url": "http://172.28.26.33:8000",
-  "poll_seconds": 3
-}
-```
-
-Agent 优先读取运行用户的 `CODEX_HOME/auth.json`，否则读取用户目录 `.codex/auth.json`。心跳仅报告账号 ID、邮箱等识别信息，不携带认证令牌；服务端记录请求的连接 IP，账号绑定按 Agent 实例独立保存，避免相同出口 IP 的机器互相覆盖。当前账号改变时，会先停止向旧绑定上传，等待服务端重新识别。自动关联模式随当前登录账号切换；手动关联模式持续使用所选目标，选择时应确认对应账号。
-
-关联成功后，Agent 在有效文件连续两次检查稳定后上传；同账号重新登录通常约 3–6 秒，首次关联或切换账号需要先等待下一次心跳（约 30 秒）。退出登录、文件临时缺失或 JSON 尚未写完时继续等待，不删除中枢账号。失败按 5 秒起步、最长 5 分钟间隔重试，新凭据会解除旧凭据的重试等待。同步状态保存在配置旁的 `agent_config.state.json`，仅含哈希和账号 ID，不保存令牌。请保留该文件，避免重启后再次上传本地旧凭据。后台日志为同目录 `agent_config.log`，自动轮转，Windows 下同一配置仅允许一个实例运行。
-
-Agent 监测本机登录或 token 更新后产生的认证文件，不代替用户完成网页登录，也不会把中枢刷新的 token 写回本机。自动启动任务使用当前登录用户运行，需要该用户保持 Windows 会话。本地连接参数修改后需重启 Agent，服务端账号关联修改后自动生效。生产环境可配置 HTTPS 中枢地址；如代理要求 Bearer 认证，可通过 `CODEX_AUTH_HUB_TOKEN` 环境变量传入中枢令牌。
-
-源码运行与打包（Agent 仅依赖 Python 标准库）：
-
-```powershell
-python agent/auth_agent.py --config agent/agent_config.json --check
-python agent/auth_agent.py --config agent/agent_config.json
-cd agent
-python -m unittest test_auth_agent -v
-python -m PyInstaller --noconfirm --distpath . CodexAuthAgent.spec
-```
+安装成功会清理同目录旧版登录启动项、计划任务和后台进程，并删除旧启动脚本。详细操作见 [Agent 服务说明](agent/README.md)。运行日志为 `agent_config.log`，初始化异常可查看 Windows 应用程序事件日志。
 
 ---
 
