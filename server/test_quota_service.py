@@ -8,10 +8,93 @@ from unittest.mock import MagicMock, patch
 from quota_service import (build_profile_quota, fetch_codex_quota, parse_quota_windows,
                            update_profile_quota_in_db, token_remaining_seconds,
                            build_profile_auth_status, auth_tokens_hash, update_profile_auth_status)
+from quota_service import cleanup_quota_observations, trigger_quota_cycle
+
+
+class QuotaCycleTriggerTests(unittest.TestCase):
+    def call_trigger(self, events, status=200, catalog_status=200, model=""):
+        self.requests = []
+        def handle(request):
+            self.requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(catalog_status, json={"models": [
+                    {"slug": "hidden", "visibility": "hide"},
+                    {"slug": "available", "visibility": "list"}]})
+            return httpx.Response(status, text=events, headers={"content-type": "text/event-stream"})
+        client = httpx.Client(transport=httpx.MockTransport(handle))
+        with patch("quota_service.httpx.Client", return_value=client), patch.dict("os.environ", {"QUOTA_TRIGGER_MODEL": model}):
+            return trigger_quota_cycle({"tokens": {"access_token": "test-token"}})
+
+    def test_uses_available_model_and_waits_for_completed(self):
+        result = self.call_trigger('data: {"type":"response.created"}\n\ndata: {"type":"response.completed"}\n\n')
+        self.assertEqual(result, {"success": True, "model": "available"})
+        self.assertEqual([r.method for r in self.requests], ["GET", "POST"])
+        request = self.requests[1]
+        self.assertEqual(str(request.url), "https://api.openai.com/v1/responses")
+        self.assertEqual(request.headers["Authorization"], "Bearer test-token")
+        payload = json.loads(request.content)
+        self.assertEqual(payload["model"], "available")
+        self.assertFalse(payload["store"])
+        self.assertTrue(payload["stream"])
+
+    def test_http_success_without_completed_event_is_failure(self):
+        for events in ('data: {"type":"response.failed"}\n\n',
+                       'data: {"type":"response.incomplete"}\n\n',
+                       'data: {"type":"error","message":"secret"}\n\n',
+                       'data: {"type":"response.created"}\n\n', 'data: [DONE]\n\n'):
+            with self.subTest(events=events):
+                result = self.call_trigger(events)
+                self.assertFalse(result["success"])
+                self.assertNotIn("secret", json.dumps(result))
+
+    def test_catalog_failure_does_not_send_inference(self):
+        self.assertFalse(self.call_trigger("", catalog_status=401)["success"])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_unavailable_configured_model_is_not_called(self):
+        self.assertFalse(self.call_trigger("", model="missing")["success"])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_inference_http_failure_does_not_retry(self):
+        self.assertFalse(self.call_trigger("secret", status=429)["success"])
+        self.assertEqual(len(self.requests), 2)
+
+    def test_network_error_is_sanitized(self):
+        with patch("quota_service.httpx.Client", side_effect=httpx.ConnectError("secret")):
+            result = trigger_quota_cycle({"tokens": {"access_token": "test"}})
+        self.assertFalse(result["success"])
+        self.assertNotIn("secret", json.dumps(result))
+
+    def test_no_access_token_does_not_make_requests(self):
+        with patch("quota_service.httpx.Client") as client:
+            self.assertFalse(trigger_quota_cycle({})["success"])
+        client.assert_not_called()
+
+
+class QuotaObservationCleanupTests(unittest.TestCase):
+    def test_cleanup_commits_batch_and_returns_deleted_count(self):
+        with patch("quota_service.get_connection") as db:
+            conn = db.return_value.__enter__.return_value
+            cursor = conn.cursor.return_value.__enter__.return_value
+            cursor.rowcount = 17
+            self.assertEqual(cleanup_quota_observations(), 17)
+            self.assertEqual(cursor.execute.call_args.args[1], (14, 5000))
+            conn.commit.assert_called_once()
+
+    def test_cleanup_error_does_not_commit(self):
+        with patch("quota_service.get_connection") as db:
+            conn = db.return_value.__enter__.return_value
+            conn.cursor.return_value.__enter__.return_value.execute.side_effect = RuntimeError("failed")
+            with self.assertRaises(RuntimeError):
+                cleanup_quota_observations()
+            conn.commit.assert_not_called()
 
 
 class QuotaWindowTests(unittest.TestCase):
     def setUp(self):
+        trigger = patch("quota_service.trigger_quota_cycle", return_value={"success": True})
+        trigger.start()
+        self.addCleanup(trigger.stop)
         self.now = datetime(2026, 10, 14, 8, 0, tzinfo=timezone.utc)
 
     def window(self, period, used, reset_in=3600):
@@ -111,11 +194,18 @@ class QuotaWindowTests(unittest.TestCase):
 
 
 class TokenRefreshTests(unittest.TestCase):
+    def full_quota(self):
+        return {"rate_limit": {"primary_window": {
+            "limit_window_seconds": 18000, "used_percent": 0}}}
+
     def jwt(self, expiry):
         payload = base64.urlsafe_b64encode(json.dumps({"exp": expiry}).encode()).decode().rstrip("=")
         return f"header.{payload}.signature"
 
     def setUp(self):
+        trigger = patch("quota_service.trigger_quota_cycle", return_value={"success": True})
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
         self.auth = {"tokens": {"access_token": "old-access", "refresh_token": "old-refresh",
                                 "id_token": "old-id", "account_id": "account"}, "extra": "keep"}
         self.http_patch = patch("quota_service.httpx.Client")
@@ -140,7 +230,7 @@ class TokenRefreshTests(unittest.TestCase):
         def retry(*args, **kwargs):
             self.connection.commit.assert_called_once()
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer new-access")
-            return self.response(200)
+            return self.response(200, self.full_quota())
         calls = []
         def query(*args, **kwargs):
             calls.append(kwargs["headers"]["Authorization"])
@@ -158,6 +248,7 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertNotIn("new-access", json.dumps(result))
         self.assertEqual(self.auth["tokens"]["access_token"], "old-access")
         self.assertEqual(self.status.call_args.args[2]["tokens"], saved["tokens"])
+        self.assertEqual(self.trigger.call_args.args[0]["tokens"], saved["tokens"])
 
     def test_failed_quota_retry_keeps_rotated_tokens_and_does_not_loop(self):
         for status in (401, 429, 500):
@@ -204,10 +295,45 @@ class TokenRefreshTests(unittest.TestCase):
         self.assertEqual(self.http.get.call_args.kwargs["headers"]["Authorization"], "Bearer already-refreshed")
 
     def test_healthy_token_does_not_refresh_or_read_database(self):
-        self.http.get.return_value = self.response(200)
+        self.http.get.return_value = self.response(200, self.full_quota())
         self.assertTrue(fetch_codex_quota(self.auth, profile_id=3)["success"])
         self.http.post.assert_not_called()
         self.cursor.execute.assert_not_called()
+        self.trigger.assert_called_once_with(self.auth)
+
+    def test_failed_quota_query_does_not_trigger_model(self):
+        self.http.get.return_value = self.response(429)
+        self.assertFalse(fetch_codex_quota(self.auth, profile_id=3)["success"])
+        self.trigger.assert_not_called()
+
+    def test_model_failure_does_not_invalidate_successful_quota(self):
+        self.http.get.return_value = self.response(200, self.full_quota())
+        self.trigger.return_value = {"success": False, "error": "周期触发请求失败"}
+        with self.assertLogs("quota_service", level="WARNING"):
+            result = fetch_codex_quota(self.auth, profile_id=3)
+        self.assertTrue(result["success"])
+        self.assertFalse(result["cycle_trigger"]["success"])
+
+    def test_only_remaining_100_percent_triggers_model(self):
+        for period in (18000, 604800):
+            for used in (0, 1, 50, 100, None, True, "0"):
+                with self.subTest(period=period, used=used):
+                    self.trigger.reset_mock()
+                    self.http.get.return_value = self.response(200, {"rate_limit": {"primary_window": {
+                        "limit_window_seconds": period, "used_percent": used}}})
+                    result = fetch_codex_quota(self.auth, profile_id=3)
+                    self.assertTrue(result["success"])
+                    if used == 0 and not isinstance(used, bool):
+                        self.trigger.assert_called_once()
+                    else:
+                        self.trigger.assert_not_called()
+                        self.assertTrue(result["cycle_trigger"]["skipped"])
+
+    def test_missing_windows_do_not_trigger_model(self):
+        self.http.get.return_value = self.response(200)
+        result = fetch_codex_quota(self.auth, profile_id=3)
+        self.assertTrue(result["cycle_trigger"]["skipped"])
+        self.trigger.assert_not_called()
 
     def test_refresh_network_failure_does_not_expose_credentials(self):
         self.http.get.return_value = self.response(401)

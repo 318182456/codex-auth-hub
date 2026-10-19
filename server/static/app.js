@@ -75,12 +75,17 @@ function formatPlanName(rawPlan) {
   return rawPlan;
 }
 
-async function fetchProfiles() {
+async function fetchProfiles({background = false} = {}) {
   try {
     const res = await fetch("/api/profiles");
     if (!res.ok) throw new Error("加载配置失败");
     currentProfiles = await res.json();
-    renderProfiles();
+    // 阅读历史、选择日期或复制文字时保持节点，避免轮询打断交互。
+    const selection = window.getSelection();
+    const interacting = profilesGrid.querySelector('.quota-history[open]') ||
+      (profilesGrid.contains(document.activeElement) && document.activeElement.matches('input, select, textarea')) ||
+      (selection && !selection.isCollapsed && profilesGrid.contains(selection.anchorNode));
+    if (!background || !interacting) renderProfiles();
     updateStats();
   } catch (err) {
     console.error(err);
@@ -192,6 +197,13 @@ function updateStats() {
 
 function renderProfiles() {
   const openHistoryPanels = Array.from(profilesGrid.querySelectorAll('.quota-history[open]'));
+  // 节点即使复用，脱离文档时浏览器仍会把内部滚动位置清零。
+  const scrollPositions = Array.from(profilesGrid.querySelectorAll('.profile-card')).map(card => ({
+    id: card.dataset.id,
+    history: card.querySelector('.quota-history-entries')?.scrollTop || 0,
+    users: card.querySelector('.users-list')?.scrollTop || 0
+  }));
+  const pageScroll = {left: window.scrollX, top: window.scrollY};
   const query = filterInput.value.trim().toLowerCase();
   const filtered = currentProfiles.filter(p => {
     if (!query) return true;
@@ -353,6 +365,16 @@ function renderProfiles() {
     const replacement = document.getElementById(panel.id);
     if (replacement) replacement.replaceWith(panel);
   }
+  for (const position of scrollPositions) {
+    const card = Array.from(profilesGrid.querySelectorAll('.profile-card'))
+      .find(element => element.dataset.id === position.id);
+    if (!card) continue;
+    const history = card.querySelector('.quota-history-entries');
+    const users = card.querySelector('.users-list');
+    if (history) history.scrollTop = position.history;
+    if (users) users.scrollTop = position.users;
+  }
+  window.scrollTo(pageScroll);
 }
 
 function renderLogs(logs) {
@@ -403,13 +425,21 @@ async function renameProfile(profileId) {
 
 async function manualRefreshQuota(profileId) {
   try {
-    showToast("正在向官方查询最新额度...", "info");
+    showToast("正在查询额度，剩余100%时将发送周期触发请求...", "info");
     const res = await fetch(`/api/profiles/${profileId}/refresh-quota`, { method: "POST" });
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.detail || "刷新失败");
     }
-    showToast("额度已同步为官方最新数据！", "success");
+    const result = await res.json();
+    const trigger = result.quota?.cycle_trigger;
+    if (trigger && !trigger.success) {
+      showToast(`额度已同步；${trigger.error}`, "error");
+    } else if (!trigger || trigger.skipped) {
+      showToast("额度已同步为官方最新数据", "success");
+    } else {
+      showToast("额度已同步，周期触发请求已完成", "success");
+    }
   } catch (err) {
     showToast(err.message, "error");
   } finally {
@@ -759,7 +789,7 @@ fetchLogs();
 fetchTeamUsers();
 setInterval(() => {
   fetchAgents();
-  fetchProfiles();
+  fetchProfiles({background: true});
   fetchLogs();
   fetchTeamUsers();
 }, 5000);

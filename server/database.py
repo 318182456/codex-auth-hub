@@ -183,6 +183,8 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_quota_observations_profile_time
                     ON quota_observations(profile_id, observed_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_quota_observations_time
+                    ON quota_observations(observed_at, id);
             """)
 
             # 索引

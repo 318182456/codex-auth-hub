@@ -2,6 +2,8 @@ import json
 import base64
 import hashlib
 import logging
+import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 import httpx
@@ -11,6 +13,77 @@ USAGE_API_URL = "https://chatgpt.com/backend-api/wham/usage"
 TOKEN_REFRESH_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_REFRESH_WINDOW_SECONDS = 300
+QUOTA_OBSERVATION_RETENTION_DAYS = 14
+QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE = 5000
+MODEL_CATALOG_URL = "https://api.openai.com/v1/models"
+MODEL_RESPONSE_URL = "https://api.openai.com/v1/responses"
+
+
+def trigger_quota_cycle(auth_json: dict) -> dict:
+    """用一次短模型请求尝试启动额度周期；失败不覆盖已查询的额度。"""
+    token = (auth_json.get("tokens") or {}).get("access_token")
+    if not token:
+        return {"success": False, "error": "缺少模型请求所需的 access_token"}
+    model = os.getenv("QUOTA_TRIGGER_MODEL", "").strip()
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            catalog = client.get(MODEL_CATALOG_URL, headers=headers)
+            if catalog.status_code != 200:
+                return {"success": False, "error": f"模型列表查询失败 (HTTP {catalog.status_code})"}
+            models = [m.get("slug") for m in catalog.json().get("models", [])
+                      if isinstance(m, dict) and m.get("visibility") == "list" and m.get("slug")]
+            if model and model not in models:
+                return {"success": False, "error": "指定模型不在当前账号可用模型列表中"}
+            if not models:
+                return {"success": False, "error": "当前账号未返回可用模型"}
+            model = model or models[0]
+            deadline = time.monotonic() + 30
+            with client.stream("POST", MODEL_RESPONSE_URL, headers={**headers, "Accept": "text/event-stream"},
+                               json={"model": model, "input": [{"role": "user", "content": "Reply only OK."}],
+                                     "instructions": "Reply with exactly OK. Do not use tools.",
+                                     "store": False, "stream": True}) as response:
+                if response.status_code != 200:
+                    return {"success": False, "model": model,
+                            "error": f"周期触发请求失败 (HTTP {response.status_code})"}
+                data_lines = []
+                for line in response.iter_lines():
+                    if time.monotonic() > deadline:
+                        return {"success": False, "model": model, "error": "周期触发请求超时"}
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].strip())
+                    elif not line and data_lines:
+                        data = "\n".join(data_lines)
+                        data_lines = []
+                        if data == "[DONE]":
+                            break
+                        event = json.loads(data)
+                        kind = event.get("type")
+                        if kind == "response.completed":
+                            return {"success": True, "model": model}
+                        if kind in ("response.failed", "response.incomplete", "error"):
+                            return {"success": False, "model": model, "error": "周期触发模型请求未完成"}
+        return {"success": False, "model": model, "error": "周期触发响应中断，未确认完成"}
+    except Exception:
+        # 不回传异常或模型响应正文，避免凭据和远端内容进入日志/API。
+        return {"success": False, "error": "周期触发请求失败，请稍后重试"}
+
+
+def cleanup_quota_observations() -> int:
+    """分批删除过期快照，避免积压历史在一次事务中全部删除。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM quota_observations WHERE id IN (
+                    SELECT id FROM quota_observations
+                    WHERE observed_at < CURRENT_TIMESTAMP - %s * INTERVAL '1 day'
+                    ORDER BY observed_at, id
+                    LIMIT %s
+                );
+            """, (QUOTA_OBSERVATION_RETENTION_DAYS, QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE))
+            deleted = cur.rowcount
+        conn.commit()
+    return deleted
 
 
 class TokenRefreshError(ValueError):
@@ -241,6 +314,16 @@ def fetch_codex_quota(auth_json: dict, profile_id: Optional[int] = None) -> Dict
             update_profile_auth_status(profile_id, result, checked_auth)
         except Exception:
             logging.getLogger(__name__).error("[AuthStatus] 配置 %s 验证状态保存失败", profile_id)
+    if result.get("success") and any(
+        window.get("available") and window.get("remaining_percent") == 100
+        for window in (result.get("primary_5h") or {}, result.get("secondary_weekly") or {})
+    ):
+        result["cycle_trigger"] = trigger_quota_cycle(checked_auth)
+        if not result["cycle_trigger"]["success"]:
+            logging.getLogger(__name__).warning("[QuotaCycle] 配置 %s 模型请求未完成：%s", profile_id,
+                                                result["cycle_trigger"]["error"])
+    elif result.get("success"):
+        result["cycle_trigger"] = {"success": True, "skipped": True}
     return result
 
 

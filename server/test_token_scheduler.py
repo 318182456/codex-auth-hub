@@ -39,6 +39,41 @@ class TokenSchedulerTests(unittest.TestCase):
         status = patch("token_scheduler.update_profile_auth_status")
         self.status = status.start()
         self.addCleanup(status.stop)
+        cleanup = patch("token_scheduler.cleanup_quota_observations", return_value=0)
+        self.cleanup = cleanup.start()
+        self.addCleanup(cleanup.stop)
+
+    def test_history_cleanup_runs_without_accounts_and_waits_one_hour(self):
+        self.cursor.fetchall.return_value = []
+        with patch("token_scheduler.time.monotonic", return_value=100):
+            self.scheduler.check_once()
+        self.cleanup.assert_called_once()
+        with patch("token_scheduler.time.monotonic", return_value=3699):
+            self.scheduler.check_once()
+        self.cleanup.assert_called_once()
+        with patch("token_scheduler.time.monotonic", return_value=3700):
+            self.scheduler.check_once()
+        self.assertEqual(self.cleanup.call_count, 2)
+
+    def test_history_backlog_continues_next_scan(self):
+        from quota_service import QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE
+        self.cursor.fetchall.return_value = []
+        self.cleanup.side_effect = [QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE, 3]
+        with patch("token_scheduler.time.monotonic", return_value=100):
+            self.scheduler.check_once()
+            self.scheduler.check_once()
+            self.scheduler.check_once()
+        self.assertEqual(self.cleanup.call_count, 2)
+
+    def test_cleanup_failure_does_not_block_quota_and_retries(self):
+        self.cursor.fetchall.return_value = [self.profile(1, remaining=864000)]
+        self.cleanup.side_effect = [RuntimeError("secret"), 0]
+        with self.assertLogs("token_scheduler", level="ERROR") as logs:
+            self.scheduler.check_once()
+        self.assertNotIn("secret", "".join(logs.output))
+        self.quota.assert_called_once()
+        self.scheduler.check_once()
+        self.assertEqual(self.cleanup.call_count, 2)
 
     def test_only_due_refreshable_profiles_are_refreshed(self):
         profiles = [self.profile(1), self.profile(2, -10), self.profile(3, 3600), self.profile(4, refresh=None),
@@ -81,6 +116,7 @@ class TokenSchedulerTests(unittest.TestCase):
         self.scheduler.stop()
         self.scheduler.check_once()
         self.refresh.assert_not_called()
+        self.cleanup.assert_not_called()
 
     def test_checks_actual_validity_even_if_expiry_is_far_away(self):
         profile = self.profile(1, remaining=864000)

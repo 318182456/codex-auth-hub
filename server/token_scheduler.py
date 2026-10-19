@@ -8,12 +8,14 @@ import httpx
 
 from database import get_connection
 from quota_service import (TOKEN_REFRESH_WINDOW_SECONDS, _refresh_profile_auth, token_remaining_seconds,
-                           fetch_codex_quota, update_profile_quota_in_db, update_profile_auth_status)
+                           fetch_codex_quota, update_profile_quota_in_db, update_profile_auth_status,
+                           cleanup_quota_observations, QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE)
 
 logger = logging.getLogger(__name__)
 TOKEN_CHECK_INTERVAL_SECONDS = 60
 TOKEN_FAILURE_RETRY_SECONDS = 300
 QUOTA_CHECK_INTERVAL_SECONDS = 90
+QUOTA_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 class TokenRefreshScheduler:
@@ -22,6 +24,7 @@ class TokenRefreshScheduler:
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name="token-refresh", daemon=True)
         self.failed_profiles = {}
+        self.next_quota_cleanup = 0
 
     def start(self):
         self.thread.start()
@@ -43,6 +46,16 @@ class TokenRefreshScheduler:
             self.stop_event.wait(self.interval)
 
     def check_once(self):
+        if not self.stop_event.is_set() and time.monotonic() >= self.next_quota_cleanup:
+            try:
+                deleted = cleanup_quota_observations()
+            except Exception:
+                logger.error("[QuotaCleanup] 额度历史清理失败，下一轮重试")
+            else:
+                # 满批时下一轮继续消化积压；清理完成后每小时检查一次。
+                if deleted < QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE:
+                    self.next_quota_cleanup = time.monotonic() + QUOTA_CLEANUP_INTERVAL_SECONDS
+
         with get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id, auth_json, quota_last_updated FROM auth_profiles WHERE is_active = TRUE ORDER BY id;")
