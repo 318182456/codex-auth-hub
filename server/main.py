@@ -26,7 +26,7 @@ from psycopg.errors import UniqueViolation
 
 import secrets
 from database import get_connection, init_db, hash_password, verify_password
-from quota_service import fetch_codex_quota, update_profile_quota_in_db, format_duration, build_profile_quota, build_profile_auth_status
+from quota_service import fetch_codex_quota, update_profile_quota_in_db, format_duration, build_profile_quota, build_profile_auth_status, load_quota_recovery_estimates
 from token_scheduler import TokenRefreshScheduler
 from agent_service import register_agent_routes
 
@@ -422,6 +422,7 @@ def list_profiles(background_tasks: BackgroundTasks):
                 GROUP BY profile_id;
             """)
             usage_counts = {row["profile_id"]: row["total_count"] for row in cur.fetchall()}
+            recovery_estimates = load_quota_recovery_estimates(cur, [profile["id"] for profile in profiles], now)
 
     sessions_by_profile: Dict[int, List[Dict[str, Any]]] = {}
     for s in active_sessions:
@@ -463,7 +464,7 @@ def list_profiles(background_tasks: BackgroundTasks):
         if should_refresh_quota and p["is_active"]:
             background_tasks.add_task(sync_profile_quota, pid, p["auth_json"])
 
-        quota_data = build_profile_quota(p, now)
+        quota_data = build_profile_quota(p, now, recovery_estimates.get(pid))
 
         result.append({
             "id": pid,

@@ -55,8 +55,8 @@ async function loadQuotaHistory(profileId) {
         const decreased = old?.used_percent != null && w.used_percent != null && w.used_percent < old.used_percent;
         const resetChanged = old?.reset_at && w.reset_at && Math.abs(new Date(w.reset_at) - new Date(old.reset_at)) > 60000;
         return `<div>${escapeHtml(w.name)}：已用 ${w.used_percent == null ? '未知' : escapeHtml(String(w.used_percent)) + '%'}<br>
-          预计重置：${escapeHtml(formatQuotaTime(w.reset_at))}${w.reset_source === 'estimated' ? '（按剩余秒数推算）' : ''}
-          ${decreased ? `<div class="quota-change">用量下降：${escapeHtml(String(old.used_percent))}% → ${escapeHtml(String(w.used_percent))}%<br>发生区间：${escapeHtml(formatQuotaTime(previous.observed_at))} 至本次查询</div>` : ''}
+          接口记录的重置时间（仅供对照）：${escapeHtml(formatQuotaTime(w.reset_at))}${w.reset_source === 'estimated' ? '（按接口剩余秒数推算）' : ''}
+          ${decreased ? `<div class="quota-change">${w.used_percent === 0 ? '实际恢复（用量归零）' : '用量下降'}：${escapeHtml(String(old.used_percent))}% → ${escapeHtml(String(w.used_percent))}%<br>发生区间：${escapeHtml(formatQuotaTime(previous.observed_at))} 至本次查询</div>` : ''}
           ${resetChanged ? `<div class="quota-change">预计重置时间已变更，上次：${escapeHtml(formatQuotaTime(old.reset_at))}</div>` : ''}</div>`;
       }).join('')}</div>`).join('') : '当天暂无记录；记录从新版服务启用后开始。';
   } catch (error) {
@@ -285,9 +285,10 @@ function renderProfiles() {
             <div class="progress-track"><div class="progress-fill ${color}" style="width: ${w.remaining_percent}%;"></div></div>
             <div class="quota-foot">
               <span>窗口: ${w.window_seconds === 604800 ? '7天' : '5小时'}</span>
-              <span class="quota-reset">${w.reset_after_seconds == null ? '重置时间未知' : w.reset_after_seconds === 0 ? '预计时间已到，等待查询确认' : `预计 ${escapeHtml(w.reset_after_text)}后重置`}</span>
+              <span class="quota-reset">${w.reset_after_seconds == null ? '历史恢复样本不足' : w.reset_after_seconds === 0 ? '预估时间已到，等待实际恢复' : `预计 ${escapeHtml(w.reset_after_text)}后恢复`}</span>
             </div>
-            <div class="quota-timestamp">预计重置：${escapeHtml(formatQuotaTime(w.reset_at))}${w.reset_source === 'estimated' ? '（推算）' : ''}</div>
+            <div class="quota-timestamp">历史预估恢复：${w.reset_source === 'history' ? escapeHtml(formatQuotaTime(w.reset_at)) : '暂无，需至少两次实际恢复记录'}</div>
+            ${w.reset_source === 'history' ? `<div class="quota-timestamp">依据最近 ${w.recovery_sample_count} 次实际恢复，间隔约 ${escapeHtml(w.estimated_cycle_text)}${w.recovery_sample_count === 2 ? '（样本较少，仅供参考）' : '，仅供参考'}<br>最近观测到恢复：${escapeHtml(formatQuotaTime(w.last_recovered_at))}<br>按采样间隔推算：${escapeHtml(formatQuotaTime(w.prediction_range_start))} ～ ${escapeHtml(formatQuotaTime(w.prediction_range_end))}</div>` : ''}
           </div>`;
         }).join('')}
       </div>

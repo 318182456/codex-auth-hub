@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import time
+from statistics import median
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 import httpx
@@ -287,7 +288,81 @@ def parse_quota_windows(data: dict, now: Optional[datetime] = None,
     return windows
 
 
-def build_profile_quota(profile: dict, now: Optional[datetime] = None) -> Dict[str, Any]:
+def load_quota_recovery_estimates(cur, profile_ids: list, now: datetime) -> dict:
+    """Find observed nonzero-to-zero transitions, independently of API reset times."""
+    if not profile_ids:
+        return {}
+    cur.execute("""
+        WITH samples AS (
+            SELECT profile_id, id, observed_at, item.key AS window_key,
+                (item.value->>'available')::boolean AS available,
+                CASE WHEN jsonb_typeof(item.value->'used_percent') = 'number'
+                     THEN (item.value->>'used_percent')::float END AS used_percent,
+                (item.value->>'window_seconds')::int AS window_seconds
+            FROM quota_observations
+            CROSS JOIN LATERAL jsonb_each(windows) AS item
+            WHERE profile_id = ANY(%s) AND observed_at >= %s AND observed_at <= %s
+              AND item.key IN ('five_hour', 'weekly')
+        ), transitions AS (
+            SELECT *,
+                LAG(observed_at) OVER history AS previous_at,
+                LAG(used_percent) OVER history AS previous_used,
+                LAG(available) OVER history AS previous_available,
+                LAG(window_seconds) OVER history AS previous_window_seconds
+            FROM samples
+            WINDOW history AS (PARTITION BY profile_id, window_key ORDER BY observed_at, id)
+        )
+        SELECT profile_id, window_key, previous_at, observed_at
+        FROM transitions
+        WHERE available AND previous_available AND used_percent = 0 AND previous_used > 0
+          AND window_seconds = previous_window_seconds
+        ORDER BY profile_id, window_key, observed_at;
+    """, (profile_ids, now - timedelta(days=QUOTA_OBSERVATION_RETENTION_DAYS), now))
+    return estimate_quota_recoveries(cur.fetchall(), now)
+
+
+def estimate_quota_recoveries(rows: list, now: datetime) -> dict:
+    events = {}
+    for row in rows:
+        start, end = row["previous_at"], row["observed_at"]
+        # Long outages cannot locate a reset accurately enough for prediction.
+        if not start or not end or not 0 < (end - start).total_seconds() <= 900 or end > now:
+            continue
+        key = (row["profile_id"], row["window_key"])
+        events.setdefault(key, []).append((start, end))
+    result = {}
+    for (profile_id, window), intervals in events.items():
+        intervals = sorted(set(intervals))[-4:]
+        if len(intervals) < 2:
+            continue
+        midpoints = [start + (end - start) / 2 for start, end in intervals]
+        periods = [(current - previous).total_seconds() for previous, current in zip(midpoints, midpoints[1:])]
+        if any(period <= 0 for period in periods):
+            continue
+        cycle = median(periods)
+        predicted = midpoints[-1] + timedelta(seconds=cycle)
+        # Bounds reflect polling uncertainty, not a guaranteed future schedule.
+        lower_period = median([(current[0] - previous[1]).total_seconds()
+                               for previous, current in zip(intervals, intervals[1:])])
+        upper_period = median([(current[1] - previous[0]).total_seconds()
+                               for previous, current in zip(intervals, intervals[1:])])
+        cycle_minutes = int(cycle // 60)
+        cycle_text = f"{cycle_minutes // 1440}天{cycle_minutes % 1440 // 60}小时{cycle_minutes % 60}分"
+        result.setdefault(profile_id, {})[window] = {
+            "reset_at": predicted.isoformat(), "reset_at_epoch": predicted.timestamp(),
+            "reset_after_seconds": max(0, int((predicted - now).total_seconds())),
+            "reset_source": "history", "recovery_sample_count": len(intervals),
+            "estimated_cycle_seconds": int(cycle), "estimated_cycle_text": cycle_text,
+            "last_recovered_at": intervals[-1][1].isoformat(),
+            "recovery_observed_from": intervals[-1][0].isoformat(),
+            "prediction_range_start": (intervals[-1][0] + timedelta(seconds=lower_period)).isoformat(),
+            "prediction_range_end": (intervals[-1][1] + timedelta(seconds=upper_period)).isoformat(),
+        }
+    return result
+
+
+def build_profile_quota(profile: dict, now: Optional[datetime] = None,
+                        recovery_estimates: Optional[dict] = None) -> Dict[str, Any]:
     """从原始缓存重建额度，兼容此前缓存中错误的固定窗口映射。"""
     raw = profile.get("quota_raw") or {}
     if isinstance(raw, str):
@@ -299,6 +374,17 @@ def build_profile_quota(profile: dict, now: Optional[datetime] = None) -> Dict[s
         raw = {}
     updated = profile.get("quota_last_updated")
     windows = parse_quota_windows(raw, now, observed_at=updated)
+    for key, window in windows.items():
+        window["official_reset_at"] = window["reset_at"]
+        window["official_reset_source"] = window["reset_source"]
+        estimate = (recovery_estimates or {}).get(key)
+        if estimate and window["available"]:
+            window.update(estimate)
+            window["reset_after_text"] = format_duration(window["reset_after_seconds"])
+        else:
+            window.update({"reset_at": None, "reset_at_epoch": None, "reset_after_seconds": None,
+                           "reset_after_text": "历史恢复样本不足", "reset_source": None,
+                           "recovery_sample_count": 0})
     return {
         "has_data": bool(updated) and any(w["available"] for w in windows.values()),
         "plan_type": profile.get("plan_type") or "CODEX",

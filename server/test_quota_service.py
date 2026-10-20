@@ -173,19 +173,21 @@ class QuotaWindowTests(unittest.TestCase):
         profile = {"quota_raw": raw, "quota_last_updated": self.now}
         quota = build_profile_quota(profile, self.now + timedelta(days=1))
         weekly = quota["weekly"]
-        self.assertEqual(weekly["reset_after_seconds"], 5 * 86400)
-        self.assertEqual(weekly["reset_at"], (self.now + timedelta(days=6)).isoformat())
-        self.assertEqual(weekly["reset_source"], "estimated")
+        self.assertIsNone(weekly["reset_after_seconds"])
+        self.assertIsNone(weekly["reset_at"])
+        self.assertEqual(weekly["official_reset_at"], (self.now + timedelta(days=6)).isoformat())
+        self.assertEqual(weekly["official_reset_source"], "estimated")
         expired = build_profile_quota(profile, self.now + timedelta(days=7))
-        self.assertEqual(expired["weekly"]["reset_after_seconds"], 0)
+        self.assertIsNone(expired["weekly"]["reset_after_seconds"])
         self.assertEqual(expired["weekly"]["used_percent"], 50)
 
     def test_absolute_reset_takes_priority_and_does_not_extend(self):
         raw = {"rate_limit": {"primary_window": self.window(604800, 50)}}
         quota = build_profile_quota({"quota_raw": raw, "quota_last_updated": self.now},
                                     self.now + timedelta(minutes=30))
-        self.assertEqual(quota["weekly"]["reset_after_seconds"], 1800)
-        self.assertEqual(quota["weekly"]["reset_source"], "official")
+        self.assertIsNone(quota["weekly"]["reset_after_seconds"])
+        self.assertIsNone(quota["weekly"]["reset_source"])
+        self.assertEqual(quota["weekly"]["official_reset_source"], "official")
 
     def test_failed_query_is_not_recorded_as_a_reset(self):
         with patch("quota_service.get_connection") as connection:
