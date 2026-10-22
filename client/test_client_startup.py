@@ -13,6 +13,7 @@ class ClientStartupTests(unittest.TestCase):
         interpreter = tk.Tcl()
         string_var = tk.StringVar
         root = MagicMock()
+        root.winfo_screenwidth.return_value = 1920
 
         def setup_ui(app):
             app.release_btn = MagicMock()

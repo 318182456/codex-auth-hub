@@ -43,6 +43,20 @@ def format_quota_window(window):
     reset = window.get("reset_after_text") or "重置时间未知"
     return f"{remaining:g}%  /  {reset}" if isinstance(remaining, (int, float)) else "暂无数据"
 
+def format_reset_date(window):
+    if window.get("available") is False:
+        return "未提供"
+    try:
+        if window.get("reset_at"):
+            reset = datetime.fromisoformat(window["reset_at"].replace("Z", "+00:00"))
+        elif window.get("reset_at_epoch") is not None:
+            reset = datetime.fromtimestamp(window["reset_at_epoch"]).astimezone()
+        else:
+            return "未知"
+        return reset.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError, OverflowError, OSError, AttributeError):
+        return "未知"
+
 def refresh_windows_env_path():
     """重新从注册表及默认路径刷新当前进程的 PATH 环境变量，使得新装的 Node / npm / codex 立即生效"""
     paths = []
@@ -636,7 +650,7 @@ class CodexClientApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Codex Auth Hub · 团队账号工作台")
-        self.root.geometry("1200x800")
+        self.root.geometry(f"{min(1600, self.root.winfo_screenwidth())}x800")
         self.root.minsize(980, 720)
 
         # 读取本地配置
@@ -747,8 +761,34 @@ class CodexClientApp:
         style.configure("TCombobox", fieldbackground="white", padding=6)
         style.configure("TLabelframe", background="#f3f5fa", bordercolor="#dce2ee", relief="solid")
         style.configure("TLabelframe.Label", font=("Microsoft YaHei UI", 10, "bold"), foreground="#42516b")
-        style.configure("Treeview", background="white", fieldbackground="white", foreground="#42516b", rowheight=40, borderwidth=0, font=("Microsoft YaHei UI", 9))
-        style.configure("Treeview.Heading", background="#f5f7fc", foreground="#7b879d", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 13), relief="flat", borderwidth=0)
+        style.configure("Treeview", background="white", fieldbackground="white", foreground="#42516b", rowheight=40, borderwidth=1, relief="solid", bordercolor="#dce2ee", lightcolor="#dce2ee", darkcolor="#dce2ee", padding=0, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview.Heading", background="#f5f7fc", foreground="#7b879d", font=("Microsoft YaHei UI", 9, "bold"), padding=(0, 13), relief="solid", borderwidth=1, bordercolor="#dce2ee", lightcolor="#dce2ee", darkcolor="#dce2ee")
+        # A transparent cell border preserves row and selection backgrounds.
+        self.table_cell_border = tk.PhotoImage(master=self.root, width=256, height=40)
+        self.table_cell_border.put("#dce2ee", to=(255, 0, 256, 40))
+        self.table_cell_border.put("#dce2ee", to=(0, 39, 256, 40))
+        style.element_create("Quota.cellborder", "image", self.table_cell_border, border=(4, 0, 4, 1), sticky="nsew")
+        # Tk 8.6 hardcodes 4px padding on both sides of every data cell.
+        # Draw grid lines on the full row, outside that padded cell parcel.
+        self.table_row_grid = tk.PhotoImage(master=self.root, width=1, height=40)
+        self._table_grid_geometry = None
+        style.element_create("Quota.rowgrid", "image", self.table_row_grid, sticky="nsew")
+        style.layout("Treeview.Row", [
+            ("Treeitem.row", {"sticky": "nsew"}),
+            ("Quota.rowgrid", {"sticky": "nsew"})
+        ])
+        style.layout("Treeview.Cell", [("Treedata.padding", {"sticky": "nsew", "children": [
+            ("Treeitem.text", {"sticky": "nsew"})
+        ]})])
+        # The heading's 4px inset matches the fixed data cell padding.
+        style.layout("Treeview.Heading", [
+            ("Treeheading.cell", {"sticky": "nsew"}),
+            ("Quota.cellborder", {"sticky": "nsew", "children": [
+                ("Treeheading.padding", {"sticky": "nsew", "children": [
+                    ("Treeheading.text", {"sticky": "nsew"})
+                ]})
+            ]})
+        ])
         style.map("Treeview", background=[("selected", "#e8edff")], foreground=[("selected", "#3848b9")])
         style.map("Treeview.Heading", background=[("active", "#edf0f8")])
         style.configure("TScrollbar", background="#d8dfed", troughcolor="white", borderwidth=0, arrowsize=12)
@@ -808,30 +848,37 @@ class CodexClientApp:
         table.pack(fill=tk.BOTH, expand=True)
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
-        columns = ("id", "name", "plan", "quota_5h", "quota_week", "users_count", "online_users", "email")
+        columns = ("id", "name", "plan", "quota_5h", "reset_5h_date", "quota_week", "reset_week_date", "users_count", "online_users", "email")
         self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse", height=3)
         for column, title, width, anchor in (
             ("id", "ID", 42, tk.CENTER),
             ("name", "账号名称", 145, tk.W),
             ("plan", "订阅", 88, tk.CENTER),
-            ("quota_5h", "5 小时剩余额度 / 重置", 175, tk.W),
-            ("quota_week", "本周剩余额度 / 重置", 175, tk.W),
+            ("quota_5h", "5 小时剩余额度 / 重置时间", 205, tk.W),
+            ("reset_5h_date", "5 小时重置日期", 160, tk.W),
+            ("quota_week", "本周剩余额度 / 重置时间", 205, tk.W),
+            ("reset_week_date", "本周重置日期", 160, tk.W),
             ("users_count", "使用人数", 80, tk.CENTER),
             ("online_users", "当前使用者", 145, tk.W),
-            ("email", "绑定邮箱", 150, tk.W),
+            ("email", "绑定邮箱", 200, tk.W),
         ):
-            self.tree.heading(column, text=title)
+            self.tree.heading(column, text=title, anchor=anchor)
             self.tree.column(column, width=width, minwidth=width, anchor=anchor, stretch=column in ("name", "online_users", "email"))
         self.tree.tag_configure("even", background="white")
         self.tree.tag_configure("odd", background="#f8faff")
         self.tree.tag_configure("current", background="#edf8f4", foreground="#168263")
         vertical = ttk.Scrollbar(table, orient=tk.VERTICAL, command=self.tree.yview)
         horizontal = ttk.Scrollbar(table, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        def on_horizontal_scroll(first, last):
+            horizontal.set(first, last)
+            self.update_account_grid()
+        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=on_horizontal_scroll)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vertical.grid(row=0, column=1, sticky="ns")
         horizontal.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self.on_select_item)
+        self.tree.bind("<Configure>", self.fit_account_columns)
+        self.tree.bind("<ButtonRelease-1>", lambda event: self.update_account_grid(), add="+")
         self.empty_label = ttk.Label(table, text="正在获取团队账号…", style="Muted.TLabel", anchor=tk.CENTER)
         self.empty_label.place(relx=0.5, rely=0.42, anchor=tk.CENTER)
 
@@ -1105,15 +1152,52 @@ class CodexClientApp:
             self.auth_token = ""
             self.root.after(0, self.update_user_display)
 
+    def fit_account_columns(self, event=None):
+        columns = tuple(self.tree["displaycolumns"])
+        if columns == ("#all",):
+            columns = tuple(self.tree["columns"])
+        minimums = {column: int(self.tree.column(column, "minwidth")) for column in columns}
+        extra = max(0, self.tree.winfo_width() - 4 - sum(minimums.values()))
+        flexible = {"name": 1, "online_users": 2, "email": 2}
+        total_weight = sum(flexible.get(column, 0) for column in columns)
+        allocated = 0
+        for column in columns:
+            share = extra * flexible.get(column, 0) // total_weight if total_weight else 0
+            if column == columns[-1]:
+                share = extra - allocated
+            allocated += share
+            self.tree.column(column, width=minimums[column] + share, stretch=False)
+        self.update_account_grid()
+
+    def update_account_grid(self):
+        columns = tuple(self.tree["displaycolumns"])
+        if columns == ("#all",):
+            columns = tuple(self.tree["columns"])
+        widths = tuple(int(self.tree.column(column, "width")) for column in columns)
+        total = sum(widths)
+        offset = round(self.tree.xview()[0] * total)
+        geometry = (widths, offset)
+        if geometry == self._table_grid_geometry or not total:
+            return
+        self._table_grid_geometry = geometry
+        self.table_row_grid.configure(width=total, height=40)
+        self.table_row_grid.blank()
+        self.table_row_grid.put("#dce2ee", to=(0, 39, total, 40))
+        edge = -offset
+        for width in widths:
+            edge += width
+            if 0 < edge <= total:
+                self.table_row_grid.put("#dce2ee", to=(edge - 1, 0, edge, 40))
+
     def on_select_item(self, event):
         selected = self.tree.selection()
         if not selected:
             self.apply_btn.configure(state=tk.DISABLED)
             return
 
-        item = self.tree.item(selected[0])
-        values = item["values"]
-        pid, pname, plan, q5, qw, users_cnt, online_u, email = values
+        pname = self.tree.set(selected[0], "name")
+        plan = self.tree.set(selected[0], "plan")
+        users_cnt = self.tree.set(selected[0], "users_count")
 
         self.selected_label.configure(
             text=f"{pname}  ·  {plan}  ·  使用人数 {users_cnt}"
@@ -1194,7 +1278,8 @@ class CodexClientApp:
         columns = tuple(self.tree["columns"])
         has_window_metadata = any("available" in ((p.get("quota") or {}).get("five_hour") or {}) for p in profiles)
         has_five_hour = any(((p.get("quota") or {}).get("five_hour") or {}).get("available") for p in profiles)
-        self.tree.configure(displaycolumns=columns if not has_window_metadata or has_five_hour else tuple(c for c in columns if c != "quota_5h"))
+        self.tree.configure(displaycolumns=columns if not has_window_metadata or has_five_hour else tuple(c for c in columns if c not in ("quota_5h", "reset_5h_date")))
+        self.fit_account_columns()
         self.profile_count_var.set(str(len(profiles)))
         self.usage_count_var.set(str(sum(len(p.get("active_users") or []) for p in profiles)))
         if profiles:
@@ -1232,7 +1317,9 @@ class CodexClientApp:
                     p["name"],
                     format_plan_name(p.get("plan_type")),
                     q5_text,
+                    format_reset_date(q5),
                     qw_text,
+                    format_reset_date(qw),
                     limit_str,
                     u_str,
                     p.get("account_email") or "-"
