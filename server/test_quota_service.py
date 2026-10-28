@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from quota_service import (build_profile_quota, fetch_codex_quota, parse_quota_windows,
                            update_profile_quota_in_db, token_remaining_seconds,
                            build_profile_auth_status, auth_tokens_hash, update_profile_auth_status)
-from quota_service import cleanup_quota_observations, trigger_quota_cycle
+from quota_service import cleanup_quota_observations, trigger_quota_cycle, trigger_profile_quota_cycle
 
 
 class QuotaCycleTriggerTests(unittest.TestCase):
@@ -23,16 +23,20 @@ class QuotaCycleTriggerTests(unittest.TestCase):
             return httpx.Response(status, text=events, headers={"content-type": "text/event-stream"})
         client = httpx.Client(transport=httpx.MockTransport(handle))
         with patch("quota_service.httpx.Client", return_value=client), patch.dict("os.environ", {"QUOTA_TRIGGER_MODEL": model}):
-            return trigger_quota_cycle({"tokens": {"access_token": "test-token"}})
+            return trigger_quota_cycle({"tokens": {"access_token": "test-token", "account_id": "test-account"}})
 
     def test_uses_available_model_and_waits_for_completed(self):
         result = self.call_trigger('data: {"type":"response.created"}\n\ndata: {"type":"response.completed"}\n\n')
         self.assertEqual(result, {"success": True, "model": "available"})
         self.assertEqual([r.method for r in self.requests], ["GET", "POST"])
         request = self.requests[1]
-        self.assertEqual(str(request.url), "https://api.openai.com/v1/responses")
+        self.assertEqual(str(request.url), "https://chatgpt.com/backend-api/codex/responses")
+        self.assertEqual(self.requests[0].url.path, "/backend-api/codex/models")
+        self.assertEqual(self.requests[0].url.params["client_version"], "0.162.1")
         self.assertEqual(request.headers["Authorization"], "Bearer test-token")
+        self.assertEqual(request.headers["ChatGPT-Account-Id"], "test-account")
         payload = json.loads(request.content)
+        self.assertEqual(payload["input"][0]["content"][0]["type"], "input_text")
         self.assertEqual(payload["model"], "available")
         self.assertFalse(payload["store"])
         self.assertTrue(payload["stream"])
@@ -69,6 +73,69 @@ class QuotaCycleTriggerTests(unittest.TestCase):
         with patch("quota_service.httpx.Client") as client:
             self.assertFalse(trigger_quota_cycle({})["success"])
         client.assert_not_called()
+
+
+class QuotaCyclePersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = {"quota_raw": {}, "quota_cycle_state": {}}
+        self.db = patch("quota_service.get_connection")
+        conn = self.db.start().return_value.__enter__.return_value
+        self.addCleanup(self.db.stop)
+        self.cursor = conn.cursor.return_value.__enter__.return_value
+        self.cursor.fetchone.side_effect = lambda: self.profile
+        def execute(sql, params):
+            if "UPDATE auth_profiles SET quota_cycle_state" in sql:
+                self.profile["quota_cycle_state"] = json.loads(params[0])
+        self.cursor.execute.side_effect = execute
+        self.trigger_patch = patch("quota_service.trigger_quota_cycle", return_value={"success": True, "model": "test"})
+        self.trigger = self.trigger_patch.start()
+        self.addCleanup(self.trigger_patch.stop)
+        self.auth = {"tokens": {"access_token": "secret", "account_id": "account"}}
+
+    def poll(self, used, reset="2026-11-04T06:40:00+00:00"):
+        return trigger_profile_quota_cycle(7, self.auth, {"secondary_weekly": {
+            "available": True, "used_percent": used, "remaining_percent": 100 - used, "reset_at": reset}})
+
+    def test_full_quota_triggers_once_across_polls_and_persisted_state(self):
+        self.assertTrue(self.poll(0)["success"])
+        for used in (0, 0, 1, 1, 0):
+            self.assertTrue(self.poll(used)["skipped"])
+        self.trigger.assert_called_once()
+        self.assertNotIn("secret", json.dumps(self.profile["quota_cycle_state"]))
+        self.assertIn("FOR UPDATE", self.cursor.execute.call_args_list[0].args[0])
+
+    def test_drop_to_one_percent_with_new_reset_boundary_triggers(self):
+        self.poll(54, "2026-11-02T06:21:53+00:00")
+        self.trigger.assert_not_called()
+        self.assertTrue(self.poll(1)["success"])
+        self.trigger.assert_called_once()
+
+    def test_small_usage_fluctuation_does_not_trigger(self):
+        self.poll(2)
+        self.assertTrue(self.poll(1)["skipped"])
+        self.trigger.assert_not_called()
+
+    def test_large_drop_without_later_reset_boundary_does_not_trigger(self):
+        self.poll(54)
+        self.assertTrue(self.poll(1)["skipped"])
+        self.trigger.assert_not_called()
+
+    def test_failed_trigger_retries_only_after_cooldown(self):
+        self.trigger.return_value = {"success": False, "error": "HTTP 503"}
+        self.assertFalse(self.poll(0)["success"])
+        self.assertTrue(self.poll(0)["skipped"])
+        self.profile["quota_cycle_state"]["weekly"]["attempted_at"] -= 301
+        self.trigger.return_value = {"success": True}
+        self.assertTrue(self.poll(0)["success"])
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_new_recovery_after_consumption_rearms_once(self):
+        self.poll(0)
+        self.profile["quota_cycle_state"]["weekly"]["attempted_at"] -= 301
+        self.poll(70)
+        self.poll(0, "2026-11-11T06:40:00+00:00")
+        self.trigger.assert_called()
+        self.assertEqual(self.trigger.call_count, 2)
 
 
 class QuotaObservationCleanupTests(unittest.TestCase):
@@ -241,7 +308,8 @@ class TokenRefreshTests(unittest.TestCase):
         result = fetch_codex_quota(self.auth, profile_id=3)
         self.assertTrue(result["success"])
         self.assertEqual(calls, ["Bearer old-access", "Bearer new-access"])
-        saved = json.loads(self.cursor.execute.call_args.args[1][0])
+        saved = json.loads(next(call.args[1][0] for call in self.cursor.execute.call_args_list
+                                if "UPDATE auth_profiles SET auth_json" in call.args[0]))
         self.assertEqual(saved["tokens"]["refresh_token"], "new-refresh")
         self.assertEqual(saved["tokens"]["account_id"], "account")
         self.assertEqual(saved["tokens"]["id_token"], "old-id")
@@ -296,11 +364,11 @@ class TokenRefreshTests(unittest.TestCase):
         self.http.post.assert_not_called()
         self.assertEqual(self.http.get.call_args.kwargs["headers"]["Authorization"], "Bearer already-refreshed")
 
-    def test_healthy_token_does_not_refresh_or_read_database(self):
+    def test_healthy_token_does_not_refresh_or_read_auth_credentials(self):
         self.http.get.return_value = self.response(200, self.full_quota())
         self.assertTrue(fetch_codex_quota(self.auth, profile_id=3)["success"])
         self.http.post.assert_not_called()
-        self.cursor.execute.assert_not_called()
+        self.assertFalse(any("SELECT auth_json" in call.args[0] for call in self.cursor.execute.call_args_list))
         self.trigger.assert_called_once_with(self.auth)
 
     def test_failed_quota_query_does_not_trigger_model(self):

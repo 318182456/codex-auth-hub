@@ -16,8 +16,9 @@ CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_REFRESH_WINDOW_SECONDS = 300
 QUOTA_OBSERVATION_RETENTION_DAYS = 14
 QUOTA_OBSERVATION_CLEANUP_BATCH_SIZE = 5000
-MODEL_CATALOG_URL = "https://api.openai.com/v1/models"
-MODEL_RESPONSE_URL = "https://api.openai.com/v1/responses"
+CODEX_CLIENT_VERSION = "0.162.1"
+MODEL_CATALOG_URL = "https://chatgpt.com/backend-api/codex/models"
+MODEL_RESPONSE_URL = "https://chatgpt.com/backend-api/codex/responses"
 
 
 def trigger_quota_cycle(auth_json: dict) -> dict:
@@ -26,10 +27,14 @@ def trigger_quota_cycle(auth_json: dict) -> dict:
     if not token:
         return {"success": False, "error": "缺少模型请求所需的 access_token"}
     model = os.getenv("QUOTA_TRIGGER_MODEL", "").strip()
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+               "originator": "codex_cli_rs", "User-Agent": f"codex_cli_rs/{CODEX_CLIENT_VERSION}"}
+    account_id = (auth_json.get("tokens") or {}).get("account_id")
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
     try:
         with httpx.Client(timeout=15.0) as client:
-            catalog = client.get(MODEL_CATALOG_URL, headers=headers)
+            catalog = client.get(MODEL_CATALOG_URL, params={"client_version": CODEX_CLIENT_VERSION}, headers=headers)
             if catalog.status_code != 200:
                 return {"success": False, "error": f"模型列表查询失败 (HTTP {catalog.status_code})"}
             models = [m.get("slug") for m in catalog.json().get("models", [])
@@ -41,7 +46,8 @@ def trigger_quota_cycle(auth_json: dict) -> dict:
             model = model or models[0]
             deadline = time.monotonic() + 30
             with client.stream("POST", MODEL_RESPONSE_URL, headers={**headers, "Accept": "text/event-stream"},
-                               json={"model": model, "input": [{"role": "user", "content": "Reply only OK."}],
+                               json={"model": model, "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply only OK."}]}],
+                                     "tools": [],
                                      "instructions": "Reply with exactly OK. Do not use tools.",
                                      "store": False, "stream": True}) as response:
                 if response.status_code != 200:
@@ -392,6 +398,65 @@ def build_profile_quota(profile: dict, now: Optional[datetime] = None,
         "last_updated": updated.isoformat() if updated else None,
     }
 
+def trigger_profile_quota_cycle(profile_id, auth_json, quota_info):
+    """Serialize per-profile triggers and remember completion across polls/restarts."""
+    windows = {"five_hour": quota_info.get("primary_5h") or {},
+               "weekly": quota_info.get("secondary_weekly") or {}}
+    if profile_id is None:
+        if any(w.get("available") and w.get("remaining_percent") == 100 for w in windows.values()):
+            return trigger_quota_cycle(auth_json)
+        return {"success": True, "skipped": True}
+    now = datetime.now(timezone.utc)
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT quota_raw, quota_cycle_state FROM auth_profiles WHERE id = %s FOR UPDATE;", (profile_id,))
+            profile = cur.fetchone()
+            if profile is None:
+                return {"success": True, "skipped": True}
+            state = profile.get("quota_cycle_state")
+            state = dict(state) if isinstance(state, dict) else {}
+            account_id = (auth_json.get("tokens") or {}).get("account_id")
+            if state.get("account_id") != account_id:
+                state = {"account_id": account_id}
+            previous = build_profile_quota({"quota_raw": profile.get("quota_raw")}, now)
+            candidates = []
+            for key, window in windows.items():
+                used = window.get("used_percent")
+                if not window.get("available") or isinstance(used, bool) or not isinstance(used, (int, float)):
+                    continue
+                entry = dict(state.get(key) or {})
+                previous_used = entry.get("last_used", previous[key].get("used_percent"))
+                previous_reset = entry.get("last_reset", previous[key].get("official_reset_at"))
+                reset = window.get("reset_at")
+                # A large drop to <=1%, with a later reset boundary, covers
+                # recovery followed by immediate real use (e.g. 54% -> 1%).
+                recovered = (isinstance(previous_used, (int, float)) and previous_used - used >= 5
+                             and used <= 1 and reset and previous_reset and reset > previous_reset)
+                if used > 1:
+                    entry["pending"] = False
+                elif recovered or (used == 0 and ("pending" not in entry or
+                                                   isinstance(previous_used, (int, float)) and previous_used > 1)):
+                    entry["pending"] = True
+                entry.update(last_used=used, last_reset=reset)
+                elapsed = now.timestamp() - entry.get("attempted_at", 0)
+                if entry.get("pending") and elapsed >= 300:
+                    candidates.append(key)
+                state[key] = entry
+            result = {"success": True, "skipped": True}
+            if candidates:
+                result = trigger_quota_cycle(auth_json)
+                for key in candidates:
+                    state[key].update(attempted_at=now.timestamp(), result=result,
+                                      pending=not result.get("success", False))
+                logging.getLogger(__name__).log(logging.INFO if result.get("success") else logging.WARNING,
+                    "[QuotaCycle] 配置 %s 周期触发%s：%s", profile_id,
+                    "成功" if result.get("success") else "失败", result.get("model") or result.get("error"))
+            cur.execute("UPDATE auth_profiles SET quota_cycle_state = %s::jsonb WHERE id = %s;",
+                        (json.dumps(state), profile_id))
+        conn.commit()
+    return result
+
+
 def fetch_codex_quota(auth_json: dict, profile_id: Optional[int] = None) -> Dict[str, Any]:
     result = _fetch_codex_quota(auth_json, profile_id)
     checked_auth = result.pop("_checked_auth", auth_json)
@@ -400,16 +465,12 @@ def fetch_codex_quota(auth_json: dict, profile_id: Optional[int] = None) -> Dict
             update_profile_auth_status(profile_id, result, checked_auth)
         except Exception:
             logging.getLogger(__name__).error("[AuthStatus] 配置 %s 验证状态保存失败", profile_id)
-    if result.get("success") and any(
-        window.get("available") and window.get("remaining_percent") == 100
-        for window in (result.get("primary_5h") or {}, result.get("secondary_weekly") or {})
-    ):
-        result["cycle_trigger"] = trigger_quota_cycle(checked_auth)
-        if not result["cycle_trigger"]["success"]:
-            logging.getLogger(__name__).warning("[QuotaCycle] 配置 %s 模型请求未完成：%s", profile_id,
-                                                result["cycle_trigger"]["error"])
-    elif result.get("success"):
-        result["cycle_trigger"] = {"success": True, "skipped": True}
+    if result.get("success"):
+        try:
+            result["cycle_trigger"] = trigger_profile_quota_cycle(profile_id, checked_auth, result)
+        except Exception:
+            result["cycle_trigger"] = {"success": False, "error": "周期触发状态保存失败"}
+            logging.getLogger(__name__).error("[QuotaCycle] 配置 %s 周期触发状态保存失败", profile_id)
     return result
 
 

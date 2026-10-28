@@ -155,6 +155,7 @@ def init_db():
                 ALTER TABLE auth_profiles ADD COLUMN IF NOT EXISTS auth_status_error TEXT DEFAULT '';
                 ALTER TABLE auth_profiles ADD COLUMN IF NOT EXISTS auth_checked_at TIMESTAMPTZ;
                 ALTER TABLE auth_profiles ADD COLUMN IF NOT EXISTS auth_status_tokens_hash VARCHAR(64);
+                ALTER TABLE auth_profiles ADD COLUMN IF NOT EXISTS quota_cycle_state JSONB DEFAULT '{}'::jsonb;
             """)
 
             # 登录机器 Agent 心跳；离线记录保留，便于区分离线与从未连接。
